@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import cors from 'cors';
 import { CookieJar } from 'tough-cookie';
 import { Impit } from 'impit';
-import { createCanvas, loadImage } from 'canvas';
+import { Image, createCanvas, loadImage } from 'canvas';
 
 // --- Setup __dirname for ES modules ---
 const __filename = fileURLToPath(import.meta.url);
@@ -1898,237 +1898,82 @@ const notifyTokenNeeded = () => {
     longWaiters.clear();
 };
 
-/**
- * Lightweight token pool with single-flight waiting and bounded queue.
- *
- * USAGE CONTRACT
- * --------------
- * - Call `await TokenManager.getToken()` to obtain permission to proceed.
- * - After the operation:
- *    - On success: call `TokenManager.consumeToken()` in a `finally`.
- *    - On failure/cancellation: call `TokenManager.invalidateToken()` in a `finally`.
- * - Always wrap your work in try/finally to avoid token leaks.
- * - This manager supports a single pending waiter "flight". If many callers
- *   await simultaneously with no tokens available, they will all await the
- *   same promise and be released when the first token arrives. If you need
- *   strict FIFO per-caller fairness, switch to a waiter queue design.
- */
 const TokenManager = {
-    /** @type {Array<{token:any, receivedAt:number}>} */
     tokenQueue: [],
-
-    /**
-     * @deprecated Kept for backward compatibility; not required for correctness.
-     * Single pending promise used for "single-flight" waiting.
-     * @type {Promise<any>|null}
-     */
     tokenPromise: null,
-
-    /**
-     * @deprecated Kept for backward compatibility; resolver for `tokenPromise`.
-     * @type {((t:any)=>void)|null}
-     */
     resolvePromise: null,
-
-    /** Whether clients should try to provide tokens. */
     isTokenNeeded: false,
-
-    /** Milliseconds after which queued tokens are considered expired and purged. */
     TOKEN_EXPIRATION_MS: 2 * 60 * 1000,
-
-    /** Timestamp (ms) when we last raised "need token" flag. */
     _lastNeededAt: 0,
 
-    /**
-     * Remove expired tokens in-place to reduce GC churn.
-     * Also wraps legacy plain-string tokens into {token, receivedAt}.
-     *
-     * Complexity: O(n). Mutates `tokenQueue` only when needed.
-     *
-     * @returns {number} Number of tokens removed or wrapped.
-     */
     _purgeExpiredTokens() {
         const now = Date.now();
-        const q = this.tokenQueue;
-        let write = 0;
-        let changed = 0;
-
-        for (let read = 0; read < q.length; read++) {
-            let item = q[read];
-
-            // Backward compatibility: plain token → wrap it once
-            if (!item || typeof item !== 'object' || !('token' in item)) {
-                item = { token: String(item), receivedAt: now };
-                changed++;
-            }
-
-            // Keep if not expired
-            if (now - item.receivedAt < this.TOKEN_EXPIRATION_MS) {
-                if (write !== read) q[write] = item;
-                write++;
+        let changed = false;
+        const filtered = [];
+        for (const item of this.tokenQueue) {
+            if (item && typeof item === 'object' && item.token) {
+                if (now - item.receivedAt < this.TOKEN_EXPIRATION_MS) filtered.push(item);
+                else changed = true;
             } else {
-                changed++; // expired → dropped
+                // backward compatibility: plain string token — keep but wrap
+                filtered.push({ token: String(item), receivedAt: now });
+                changed = true;
             }
         }
-
-        // Trim if we removed anything
-        if (write < q.length) q.length = write;
-        return changed;
+        if (changed) this.tokenQueue = filtered;
     },
 
-    /**
-     * Request a token permission to proceed.
-     * - If a valid token is available in the queue, it returns the HEAD (not consumed).
-     *   You MUST call `consumeToken()` when your work succeeds or `invalidateToken()` on failure.
-     * - If no tokens are available, a single pending promise is created and flagged via `notifyTokenNeeded()`.
-     *   When a provider calls `setToken()`, that waiter resolves with the provided token.
-     *
-     * Safety:
-     * - Optional implicit safety timeout (default 15s). If elapsed with no token,
-     *   the promise rejects with `Error("TOKEN_TIMEOUT")` and re-flags `isTokenNeeded`.
-     *
-     * @param {{ timeoutMs?: number }=} opts Optional settings (does not change the public signature).
-     * @returns {Promise<any>} Resolves with a token object/value.
-     * @throws {Error} Rejects with "TOKEN_TIMEOUT" if waiting exceeds timeout.
-     */
-    getToken(opts) {
-        const timeoutMs = opts && typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 15000;
-
+    getToken() {
         this._purgeExpiredTokens();
-
-        // Fast path: immediate head (NOT consumed here; caller must consume/invalidate later)
         if (this.tokenQueue.length > 0) {
             const head = this.tokenQueue[0];
-            const token = head && head.token !== undefined ? head.token : head;
-            log(
-                'SYSTEM',
-                'wplacer',
-                `🛡️ TOKEN_MANAGER: Token granted instantly (head). Available: ${this.tokenQueue.length}`
-            );
-            return Promise.resolve(token);
+            return Promise.resolve(head && head.token ? head.token : head);
         }
-
-        // No available tokens → single-flight promise
         if (!this.tokenPromise) {
             log('SYSTEM', 'wplacer', '🛡️ TOKEN_MANAGER: A task is waiting for a token. Flagging for clients.');
             this.isTokenNeeded = true;
             this._lastNeededAt = Date.now();
-            notifyTokenNeeded && notifyTokenNeeded();
-
-            let resolveRef, rejectRef;
-            const p = new Promise((resolve, reject) => {
-                resolveRef = resolve;
-                rejectRef = reject;
+            notifyTokenNeeded();
+            this.tokenPromise = new Promise((resolve) => {
+                this.resolvePromise = resolve;
             });
-            this.tokenPromise = p;
-
-            // Safety timeout to prevent indefinite lock
-            const timeoutId = setTimeout(
-                () => {
-                    if (this.tokenPromise === p) {
-                        this.tokenPromise = null;
-                        this.resolvePromise = null;
-                        this.isTokenNeeded = true;
-                        log('SYSTEM', 'wplacer', '🛡️ TOKEN_MANAGER: Token wait timed out, reflagging for clients.');
-                        notifyTokenNeeded && notifyTokenNeeded();
-                        rejectRef(new Error('TOKEN_TIMEOUT'));
-                    }
-                },
-                Math.max(0, timeoutMs)
-            );
-
-            // Store resolver with cleanup
-            this.resolvePromise = (token) => {
-                clearTimeout(timeoutId);
-                if (this.tokenPromise === p) {
-                    this.tokenPromise = null;
-                    this.resolvePromise = null;
-                    resolveRef(token);
-                }
-            };
         }
-
         return this.tokenPromise;
     },
-
-    /**
-     * Provide a token into the system.
-     * - If a waiter exists (single-flight), resolve it immediately with THIS token (do not touch queue).
-     * - Otherwise, enqueue the token for future consumers.
-     *
-     * Note: This method intentionally prefers unblocking a waiter over growing the queue,
-     *       which reduces perceived latency.
-     *
-     * @param {any} t Token value or an object that may contain `.token`.
-     * @returns {void}
-     */
     setToken(t) {
-        this._purgeExpiredTokens();
-        const token = t && typeof t === 'object' && 'token' in t ? t.token : t;
-
-        if (this.resolvePromise) {
-            log('SYSTEM', 'wplacer', '🛡️ TOKEN_MANAGER: Delivering token to waiting task.');
-            const resolve = this.resolvePromise;
-            // Clean before resolving to avoid reentrancy hazards
-            this.resolvePromise = null;
-            this.tokenPromise = null;
-            this.isTokenNeeded = false;
-            resolve(token);
-            return;
-        }
-
-        // No waiter → queue for later retrieval
-        this.tokenQueue.push({ token, receivedAt: Date.now() });
-        log('SYSTEM', 'wplacer', `🛡️ TOKEN_MANAGER: Token queued. Available: ${this.tokenQueue.length}`);
+        log('SYSTEM', 'wplacer', `🛡️ TOKEN_MANAGER: Token received. Queue size: ${this.tokenQueue.length + 1}`);
         this.isTokenNeeded = false;
+        this.tokenQueue.push({ token: t, receivedAt: Date.now() });
+        if (this.resolvePromise) {
+            const head = this.tokenQueue[0];
+            this.resolvePromise(head && head.token ? head.token : head);
+            this.tokenPromise = null;
+            this.resolvePromise = null;
+        }
     },
-
-    /**
-     * Discard the current HEAD token after a failed/canceled operation.
-     * - If the queue becomes empty, re-flag the need so providers can refill.
-     *
-     * @returns {void}
-     */
     invalidateToken() {
-        this._purgeExpiredTokens();
-
-        if (this.tokenQueue.length > 0) {
-            this.tokenQueue.shift();
-        }
-        log('SYSTEM', 'wplacer', `🛡️ TOKEN_MANAGER: Invalidating token. Remaining: ${this.tokenQueue.length}`);
+        this.tokenQueue.shift();
+        log('SYSTEM', 'wplacer', `🛡️ TOKEN_MANAGER: Invalidating token. ${this.tokenQueue.length} tokens remaining.`);
 
         if (this.tokenQueue.length === 0) {
             this.isTokenNeeded = true;
             this._lastNeededAt = Date.now();
-            notifyTokenNeeded && notifyTokenNeeded();
+            notifyTokenNeeded();
         }
     },
-
-    /**
-     * Consume (remove) the HEAD token after a successful operation.
-     * - If the queue becomes empty, re-flag the need so providers can refill.
-     *
-     * IMPORTANT:
-     * - Call this ONLY for the token you just used from HEAD (i.e., the one returned by `getToken()`).
-     * - Always call within a `finally` to prevent leaks.
-     *
-     * @returns {void}
-     */
     consumeToken() {
-        this._purgeExpiredTokens();
-
         if (this.tokenQueue.length > 0) {
             this.tokenQueue.shift();
-            log('SYSTEM', 'wplacer', `🛡️ TOKEN_MANAGER: Consumed token. Remaining: ${this.tokenQueue.length}`);
-        } else {
-            // Nothing to consume: likely a waiter-delivered token (not enqueued).
-            log('SYSTEM', 'wplacer', '🛡️ TOKEN_MANAGER: consumeToken() called with empty queue (noop).');
+            log(
+                'SYSTEM',
+                'wplacer',
+                `🛡️ TOKEN_MANAGER: Consumed token after success. ${this.tokenQueue.length} tokens remaining.`
+            );
         }
-
         if (this.tokenQueue.length === 0) {
             this.isTokenNeeded = true;
             this._lastNeededAt = Date.now();
-            notifyTokenNeeded && notifyTokenNeeded();
+            notifyTokenNeeded();
         }
     },
 };
@@ -5892,7 +5737,14 @@ app.get('/export-tokens', (req, res) => {
             for (const [id, template] of Object.entries(templates)) {
                 if (template.autoStart && !template.running) {
                     try {
-                        await template.start();
+                        Promise.resolve()
+                            .then(() => template.start())
+                            .catch((err) =>
+                                console.error(
+                                    `❌ Failed to auto-start template \"${template?.name || 'unknown'}\"`,
+                                    err
+                                )
+                            );
                         autoStartedCount++;
                         console.log(`🚀 Auto-started template: ${template.name}`);
                     } catch (error) {
