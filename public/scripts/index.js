@@ -1,9 +1,35 @@
+/**
+ * @fileoverview Main client-side controller for the wplacer dashboard.
+ * The script binds UI elements, orchestrates network calls, and renders
+ * queue state updates.
+ */
+
+const CONSTANTS = window.WPLACER_CONSTANTS || {};
+const {
+    PINNED_TEMPLATES_STORAGE_KEY,
+    FLAGS_CACHE_STORAGE_KEY,
+    LAST_STATUS_STORAGE_KEY,
+    LAST_TOTALS_STORAGE_KEY,
+    DISCLAIMER_STORAGE_KEY,
+    CHANGELOG_ACK_STORAGE_KEY,
+    COLORS_CACHE_STORAGE_KEY,
+} = CONSTANTS;
+
+/**
+ * Synchronises logging preference checkboxes with the latest server settings.
+ *
+ * @returns {Promise<void>} Resolves when settings have been applied.
+ */
 async function applyLogSettingsFromServer() {
     try {
         const { data: currentSettings } = await axios.get('/settings');
         const lc = currentSettings?.logCategories || {};
-        const bind = (id) => { const el = document.getElementById(id); if (el) el.checked = lc[id.replace('log_', '')] !== false; };
-        const mask = document.getElementById('log_maskPii'); if (mask) mask.checked = !!currentSettings?.logMaskPii;
+        const bind = (id) => {
+            const el = document.getElementById(id);
+            if (el) el.checked = lc[id.replace('log_', '')] !== false;
+        };
+        const mask = document.getElementById('log_maskPii');
+        if (mask) mask.checked = !!currentSettings?.logMaskPii;
         bind('log_tokenManager');
         bind('log_cache');
         bind('log_queuePreview');
@@ -11,7 +37,7 @@ async function applyLogSettingsFromServer() {
         bind('log_startTurn');
         bind('log_mismatches');
         bind('log_estimatedTime');
-    } catch (_) { }
+    } catch (_) {}
 }
 const $ = (id) => document.getElementById(id);
 const main = $("main");
@@ -69,9 +95,29 @@ const autoStart = $("autoStart");
 const submitTemplate = $("submitTemplate");
 const manageTemplates = $("manageTemplates");
 const templateList = $("templateList");
-const PINNED_TEMPLATES_KEY = 'wplacer_pinned_templates_v1';
-const getPinned = () => { try { return JSON.parse(localStorage.getItem(PINNED_TEMPLATES_KEY) || '[]') || []; } catch { return []; } };
-const savePinned = (arr) => { try { localStorage.setItem(PINNED_TEMPLATES_KEY, JSON.stringify(Array.from(new Set(arr)))) } catch { } };
+const PINNED_TEMPLATES_KEY = PINNED_TEMPLATES_STORAGE_KEY || 'wplacer_pinned_templates_v1';
+/**
+ * Reads pinned template identifiers from localStorage.
+ *
+ * @returns {string[]} List of pinned template IDs.
+ */
+const getPinned = () => {
+    try {
+        return JSON.parse(localStorage.getItem(PINNED_TEMPLATES_KEY) || '[]') || [];
+    } catch {
+        return [];
+    }
+};
+/**
+ * Persists the pinned template list to localStorage.
+ *
+ * @param {string[]} arr Template identifiers to persist.
+ */
+const savePinned = (arr) => {
+    try {
+        localStorage.setItem(PINNED_TEMPLATES_KEY, JSON.stringify(Array.from(new Set(arr))));
+    } catch {}
+};
 const startAll = $("startAll");
 const stopAll = $("stopAll");
 const totalDropletsEl = $("totalDroplets");
@@ -125,6 +171,12 @@ let __sse; // EventSource
 
 // Keep raw lines to allow re-render on mask toggle
 const __logsRaw = [];
+
+let lastQueueSignature = null;
+let lastQueueHideSensitive = null;
+let pendingQueueMarkup = '';
+let queueRenderFrame = null;
+let queueAutoRefreshWasPaused = false;
 
 
 // flagsManager
@@ -189,9 +241,21 @@ function parseTwemojiIn(container, sizePx) {
     } catch (_) { }
 }
 
-const FLAGS_CACHE_KEY = 'wplacer_flags_cache_v1';
-let FLAGS_CACHE = null; try { FLAGS_CACHE = JSON.parse(localStorage.getItem(FLAGS_CACHE_KEY) || 'null'); } catch (_) { FLAGS_CACHE = null; }
-const saveFlagsCache = () => { try { localStorage.setItem(FLAGS_CACHE_KEY, JSON.stringify(FLAGS_CACHE)); } catch (_) { } };
+const FLAGS_CACHE_KEY = FLAGS_CACHE_STORAGE_KEY || 'wplacer_flags_cache_v1';
+let FLAGS_CACHE = null;
+try {
+    FLAGS_CACHE = JSON.parse(localStorage.getItem(FLAGS_CACHE_KEY) || 'null');
+} catch (_) {
+    FLAGS_CACHE = null;
+}
+/**
+ * Writes the current flag metadata cache to localStorage.
+ */
+const saveFlagsCache = () => {
+    try {
+        localStorage.setItem(FLAGS_CACHE_KEY, JSON.stringify(FLAGS_CACHE));
+    } catch (_) {}
+};
 
 // USERS_FLAG_STATE[userId] = { name, flagsBitmap(b64), equippedFlag, droplets }
 const USERS_FLAG_STATE = {};
@@ -309,21 +373,34 @@ clearLogs?.addEventListener('click', () => {
 let pendingUserSelection = null;
 let editSelectedUserIds = null; // Set of selected user ids while editing template
 
-const LAST_STATUS_KEY = 'wplacer_latest_user_status';
-const LAST_TOTALS_KEY = 'wplacer_latest_totals_v1';
+const LAST_STATUS_KEY = LAST_STATUS_STORAGE_KEY || 'wplacer_latest_user_status';
+const LAST_TOTALS_KEY = LAST_TOTALS_STORAGE_KEY || 'wplacer_latest_totals_v1';
 let LAST_USER_STATUS = {};
 try {
     LAST_USER_STATUS = JSON.parse(localStorage.getItem(LAST_STATUS_KEY) || '{}') || {};
 } catch (_) { LAST_USER_STATUS = {}; }
 
+/**
+ * Persists the latest queue status snapshot.
+ */
 const saveLastStatus = () => {
     try { localStorage.setItem(LAST_STATUS_KEY, JSON.stringify(LAST_USER_STATUS)); } catch (_) { }
 };
 
+/**
+ * Saves aggregate queue totals to localStorage for quick bootstrapping.
+ *
+ * @param {Record<string, unknown>} totals Aggregated totals to persist.
+ */
 const saveLatestTotals = (totals) => {
     try { localStorage.setItem(LAST_TOTALS_KEY, JSON.stringify(totals || {})); } catch (_) { }
 };
 
+/**
+ * Restores aggregate queue totals from localStorage.
+ *
+ * @returns {Record<string, unknown>|null} Previously stored totals or null.
+ */
 const loadLatestTotals = () => {
     try { return JSON.parse(localStorage.getItem(LAST_TOTALS_KEY) || 'null'); } catch (_) { return null; }
 };
@@ -415,7 +492,10 @@ messageBoxCancel.addEventListener('click', () => {
 });
 
 
-const DISCLAIMER_KEY = 'wplacer_disclaimer_ack_v1';
+const DISCLAIMER_KEY = DISCLAIMER_STORAGE_KEY || 'wplacer_disclaimer_ack_v1';
+/**
+ * Displays the legal disclaimer overlay if it has not been acknowledged yet.
+ */
 function showDisclaimerIfNeeded() {
     try { if (localStorage.getItem(DISCLAIMER_KEY) === '1') return; } catch (_) { }
     const content = `
@@ -537,7 +617,7 @@ async function checkVersionAndWarn() {
 document.addEventListener('DOMContentLoaded', checkVersionAndWarn);
 
 
-const CHANGELOG_ACK_KEY = 'wplacer_ack_version';
+const CHANGELOG_ACK_KEY = CHANGELOG_ACK_STORAGE_KEY || 'wplacer_ack_version';
 async function showChangelogOnFirstLoad() {
     try {
         const { data } = await axios.get('/version');
@@ -5778,9 +5858,12 @@ let CURRENT_SELECTED_COLOR = null;
 const USERS_COLOR_STATE = {};
 
 // Colors cache in localStorage
-const COLORS_CACHE_KEY = 'wplacer_colors_cache_v1';
+const COLORS_CACHE_KEY = COLORS_CACHE_STORAGE_KEY || 'wplacer_colors_cache_v1';
 let COLORS_CACHE = null;
 try { COLORS_CACHE = JSON.parse(localStorage.getItem(COLORS_CACHE_KEY) || 'null'); } catch (_) { COLORS_CACHE = null; }
+/**
+ * Stores the cached palette metadata in localStorage.
+ */
 const saveColorsCache = () => { try { localStorage.setItem(COLORS_CACHE_KEY, JSON.stringify(COLORS_CACHE)); } catch (_) { } };
 const colorsLastCheckLabel = $("colorsLastCheckLabel");
 const usersColorsLastCheckLabel = $("usersColorsLastCheckLabel");
@@ -6364,6 +6447,7 @@ function startQueueAutoRefresh() {
         queueRefreshInterval = setInterval(() => {
             loadQueuePreview();
         }, interval);
+        queueAutoRefreshWasPaused = false;
     }
     toggleRefreshIntervalInput();
 }
@@ -6383,6 +6467,69 @@ function stopQueueAutoRefresh() {
         clearInterval(queueRefreshInterval);
         queueRefreshInterval = null;
     }
+}
+
+/**
+ * Cancels any pending queue render frame and clears memoized state.
+ */
+function resetQueueRenderCache() {
+    lastQueueSignature = null;
+    lastQueueHideSensitive = null;
+    pendingQueueMarkup = '';
+    if (queueRenderFrame !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(queueRenderFrame);
+    }
+    queueRenderFrame = null;
+}
+
+/**
+ * Computes a lightweight signature for queue entries to detect meaningful changes.
+ *
+ * @param {Array} users Queue payload from the server.
+ * @returns {string} Deterministic signature describing the queue.
+ */
+function buildQueueSignature(users) {
+    if (!Array.isArray(users) || users.length === 0) {
+        return '__empty__';
+    }
+
+    return users
+        .map((user) => {
+            const charges = user.charges || null;
+            const availableDroplets = user.droplets ? user.droplets.available : '';
+            return [
+                user.id,
+                user.name,
+                user.status,
+                charges ? charges.current : '',
+                charges ? charges.max : '',
+                user.cooldownTime ?? '',
+                availableDroplets,
+            ].join('|');
+        })
+        .join(';');
+}
+
+/**
+ * Schedules queue markup updates on the next animation frame to avoid layout thrash.
+ *
+ * @param {string} markup HTML markup representing the queue state.
+ */
+function scheduleQueueRender(markup) {
+    pendingQueueMarkup = markup;
+    if (typeof requestAnimationFrame !== 'function') {
+        queueUserList.innerHTML = pendingQueueMarkup;
+        return;
+    }
+
+    if (queueRenderFrame !== null) {
+        return;
+    }
+
+    queueRenderFrame = requestAnimationFrame(() => {
+        queueUserList.innerHTML = pendingQueueMarkup;
+        queueRenderFrame = null;
+    });
 }
 
 async function loadQueuePreview() {
@@ -6412,17 +6559,27 @@ function updateQueueSummary(summary) {
 }
 
 function updateQueueUserList(users) {
-    if (users.length === 0) {
-        queueUserList.innerHTML = `
+    if (!Array.isArray(users) || users.length === 0) {
+        lastQueueSignature = '__empty__';
+        lastQueueHideSensitive = hideSensitiveInfoQueue.checked;
+        scheduleQueueRender(`
             <div class="queue-empty">
                 <img src="icons/manageUsers.svg" alt="" />
                 <p>No users in queue</p>
             </div>
-        `;
+        `);
         return;
     }
 
     const hideSensitive = hideSensitiveInfoQueue.checked;
+    const signature = buildQueueSignature(users);
+
+    if (!isFirstLoad && signature === lastQueueSignature && hideSensitive === lastQueueHideSensitive) {
+        return;
+    }
+
+    lastQueueSignature = signature;
+    lastQueueHideSensitive = hideSensitive;
 
     const html = users.map(user => {
         let statusClass = getStatusClass(user.status);
@@ -6450,7 +6607,7 @@ function updateQueueUserList(users) {
         `;
     }).join('');
 
-    queueUserList.innerHTML = html;
+    scheduleQueueRender(html);
 }
 
 function getStatusClass(status) {
@@ -6493,6 +6650,7 @@ function updateQueueLastUpdate(timestamp) {
 }
 
 function showQueueError(message) {
+    resetQueueRenderCache();
     queueUserList.innerHTML = `
         <div class="queue-empty">
             <img src="icons/error.svg" alt="" />
@@ -6500,6 +6658,19 @@ function showQueueError(message) {
         </div>
     `;
 }
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        if (queueRefreshInterval && autoRefreshQueue.checked) {
+            queueAutoRefreshWasPaused = true;
+            stopQueueAutoRefresh();
+        }
+    } else if (queueAutoRefreshWasPaused && autoRefreshQueue.checked) {
+        queueAutoRefreshWasPaused = false;
+        loadQueuePreview();
+        startQueueAutoRefresh();
+    }
+});
 
 function saveQueueSettings() {
     const settings = {

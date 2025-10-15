@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Forces Cloudflare Turnstile ShadowRoots into `open` mode so the
+ * extension can access internal widgets when necessary.
+ */
+
 // Open ShadowRoot on challenges.cloudflare.com to expose Turnstile internals
 console.log('[AUTO-LOGIN EXTENSION] cf-open-shadow.js loaded');
 const originalAttachShadow = Element.prototype.attachShadow;

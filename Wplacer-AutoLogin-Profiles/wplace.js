@@ -1,34 +1,52 @@
-// Content script for wplace.live to initiate login flow when requested
+/**
+ * @fileoverview Content script injected into wplace.live.
+ * Builds the management overlay, wires UI actions, and coordinates with the
+ * background service worker for login and token forwarding flows.
+ */
+
 console.log('[AUTO-LOGIN EXTENSION] wplace.js loaded');
-// Seed profileName from URL query if present (first time only)
-(function seedProfileFromQuery(){
+
+/**
+ * Seed the overlay profile name from a ?profileName query parameter.
+ * Runs only on first load to avoid clobbering user edits.
+ * @returns {void}
+ */
+function seedProfileFromQuery() {
   try {
     const u = new URL(location.href);
     const qName = (u.searchParams.get('profileName') || '').trim();
-    if (qName) {
-      chrome.runtime.sendMessage({ type: 'wplace:set-profile', profileName: qName, isSeed: true }, (resp) => {
-        try { if (resp && resp.ok) console.log('[AUTO-LOGIN EXTENSION] profileName seeded from URL'); } catch {}
-      });
-      try {
-        window.__wplaceSeedName = qName;
-        // Ensure overlay exists and set the input immediately (with retry in case input appears later)
-        try { ensureOverlay(); } catch {}
-        const tryPrefill = () => {
-          const el = document.getElementById('wplace-profile-name');
-          if (el && typeof el.value === 'string') { el.value = qName; return true; }
-          return false;
-        };
-        if (!tryPrefill()) {
-          let tries = 0; // try up to 5 times (5s)
-          const iv = setInterval(() => {
-            if (tryPrefill() || ++tries > 5) clearInterval(iv);
-          }, 1000);
-        }
-      } catch {}
-    }
+    if (!qName) return;
+
+    chrome.runtime.sendMessage({ type: 'wplace:set-profile', profileName: qName, isSeed: true }, (resp) => {
+      try { if (resp && resp.ok) console.log('[AUTO-LOGIN EXTENSION] profileName seeded from URL'); } catch {}
+    });
+
+    try {
+      window.__wplaceSeedName = qName;
+      // Ensure overlay exists and set the input immediately (with retry in case input appears later)
+      try { ensureOverlay(); } catch {}
+      const tryPrefill = () => {
+        const el = document.getElementById('wplace-profile-name');
+        if (el && typeof el.value === 'string') { el.value = qName; return true; }
+        return false;
+      };
+      if (!tryPrefill()) {
+        let tries = 0; // try up to 5 times (5s)
+        const iv = setInterval(() => {
+          if (tryPrefill() || ++tries > 5) clearInterval(iv);
+        }, 1000);
+      }
+    } catch {}
   } catch {}
-})();
-// Simple overlay UI for status and actions
+}
+
+seedProfileFromQuery();
+
+/**
+ * Ensure the status overlay exists and return its wrapper element.
+ * Creates the markup lazily so the script can run before DOMContentLoaded.
+ * @returns {HTMLElement} The overlay wrapper element.
+ */
 function ensureOverlay() {
   if (document.getElementById('wplace-overlay')) return document.getElementById('wplace-overlay');
   const wrap = document.createElement('div');
@@ -197,6 +215,12 @@ function ensureOverlay() {
   return wrap;
 }
 
+/**
+ * Apply a partial update to the overlay fields.
+ * Keeps previously shown values unless explicitly overridden.
+ * @param {{status?:string, auth?:string, token?:string, tokenFull?:string, send?:string}} fields
+ * @returns {void}
+ */
 function overlayUpdate(fields) {
   ensureOverlay();
   const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = String(v); };
@@ -223,6 +247,10 @@ function overlayUpdate(fields) {
   try { window.__wplaceLastOverlayUpdate = Date.now(); } catch {}
 }
 
+/**
+ * Determine whether the overlay currently shows a non-placeholder token.
+ * @returns {boolean}
+ */
 function hasTokenDisplayed() {
   try {
     const el = document.getElementById('wplace-token');
@@ -231,6 +259,10 @@ function hasTokenDisplayed() {
   } catch { return false; }
 }
 
+/**
+ * Read pending token data stored by the background script and reflect it in the overlay.
+ * @returns {void}
+ */
 function readPendingAndUpdate() {
   try {
     chrome.storage.local.get(['wplacerPendingToken','wplacerPendingExp','wplacerPendingTs'], (res) => {
@@ -244,10 +276,18 @@ function readPendingAndUpdate() {
   } catch {}
 }
 
+/**
+ * Request the latest state from the background script.
+ * @returns {void}
+ */
 function requestSyncFromBackground() {
   try { chrome.runtime.sendMessage({ type: 'wplace:sync' }, () => {}); } catch {}
 }
 
+/**
+ * Run an initial overlay sync as soon as possible.
+ * @returns {void}
+ */
 function earlySync() {
   try {
     ensureOverlay();
@@ -257,6 +297,10 @@ function earlySync() {
   } catch {}
 }
 
+/**
+ * Perform a deferred sync once the page is fully loaded to catch late updates.
+ * @returns {void}
+ */
 function lateSync() {
   try {
     if (!hasTokenDisplayed()) {
@@ -275,6 +319,12 @@ if (document.readyState === 'loading') {
   setTimeout(() => { try { lateSync(); } catch {} }, 0);
 }
 
+/**
+ * Evaluate an XPath expression against the document (or provided root).
+ * @param {string} xpath
+ * @param {Document|Element} [root=document]
+ * @returns {Node|null}
+ */
 function x(xpath, root=document) {
   try {
     const r = root.evaluate(xpath, root, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
@@ -285,6 +335,12 @@ function x(xpath, root=document) {
   }
 }
 
+/**
+ * Wait until an XPath selector resolves or the timeout elapses.
+ * @param {string} xpath
+ * @param {number} timeoutMs
+ * @returns {Promise<Node|null>}
+ */
 async function waitForXPath(xpath, timeoutMs) {
   const start = Date.now();
   let lastLog = 0;
@@ -300,6 +356,11 @@ async function waitForXPath(xpath, timeoutMs) {
   return null;
 }
 
+/**
+ * Attempt to find a clickable element either by CSS selector or partial text match.
+ * @param {string} selectorOrText
+ * @returns {Element|null}
+ */
 function findClickable(selectorOrText) {
   // Try CSS selector first
   try {
@@ -312,6 +373,10 @@ function findClickable(selectorOrText) {
   return candidates.find((el) => (el.textContent || '').trim().toLowerCase().includes(lower)) || null;
 }
 
+/**
+ * Locate and click the "Log in" trigger if present.
+ * @returns {Promise<boolean>} True when a click was dispatched.
+ */
 async function tryOpenLogin() {
   console.log('[AUTO-LOGIN EXTENSION] tryOpenLogin: searching login trigger');
   // If token already present on overlay, skip login
@@ -333,6 +398,10 @@ async function tryOpenLogin() {
   return false;
 }
 
+/**
+ * Wait for the Google login link and navigate to it when ready.
+ * @returns {Promise<boolean>} True if navigation was triggered.
+ */
 async function tryClickGoogle() {
   console.log('[AUTO-LOGIN EXTENSION] tryClickGoogle: waiting for google link after captcha');
   // If token already present on overlay, skip
@@ -355,6 +424,10 @@ async function tryClickGoogle() {
   return false;
 }
 
+/**
+ * Run the guided login flow (open modal, click Google, wait for redirect).
+ * @returns {Promise<void>}
+ */
 async function startLoginFlow() {
   console.log('[AUTO-LOGIN EXTENSION] startLoginFlow: begin');
   // If token already present on overlay, stop the flow immediately
@@ -372,11 +445,17 @@ async function startLoginFlow() {
   console.log('[AUTO-LOGIN EXTENSION] startLoginFlow: done');
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+/**
+ * Handle runtime messages from the background service worker.
+ * @param {any} msg
+ * @param {chrome.runtime.MessageSender} sender
+ * @param {(response?: any) => void} sendResponse
+ * @returns {boolean|void} Return true to keep the channel open for async responses.
+ */
+function handleRuntimeMessage(msg, sender, sendResponse) {
   if (msg && msg.type === 'wplace:start') {
     console.log('[AUTO-LOGIN EXTENSION] onMessage: wplace:start received');
     overlayUpdate({ status: 'Starting…' });
-    // If token already present on overlay, do not start
     if (hasTokenDisplayed()) { sendResponse && sendResponse({ ok: true, skipped: true }); return true; }
     startLoginFlow().then(() => sendResponse({ ok: true })).catch((e) => {
       console.warn('[AUTO-LOGIN EXTENSION] startLoginFlow error:', e);
@@ -386,7 +465,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg && msg.type === 'wplace:log-j') {
     try {
-      console.log('[J COOCKIE]', String(msg.value || ''));
+      console.log('[J COOKIE]', String(msg.value || ''));
       overlayUpdate({ auth: 'Authorized', token: (msg.value ? String(msg.value) : '-'), tokenFull: String(msg.value||'') });
       sendResponse && sendResponse({ ok: true });
     } catch {}
@@ -402,9 +481,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     } catch {}
     return false;
   }
-});
+  return undefined;
+}
 
-// Optional auto-start on load after a short delay, but skip if token already displayed
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => handleRuntimeMessage(msg, sender, sendResponse));
+
+/**
+ * Optional auto-start on load after a short delay, but skip if token already displayed.
+ */
 setTimeout(() => {
   try {
     if (hasTokenDisplayed()) { console.log('[AUTO-LOGIN EXTENSION] auto-start skipped (token present)'); return; }

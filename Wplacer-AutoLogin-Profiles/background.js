@@ -1,5 +1,5 @@
 /**
- * Auto-login & cookie relay for WPlace.
+ * @fileoverview Auto-login & cookie relay for WPlace.
  *
  * Responsibilities:
  * - Detect presence of "j" (and optional "s") cookies on wplace.live and backend.wplace.live.

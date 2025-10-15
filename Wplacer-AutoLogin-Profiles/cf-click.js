@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Gently guides users through Cloudflare Turnstile challenges by
+ * highlighting and focusing widgets without sending synthetic input.
+ */
+
 /* eslint-disable no-console */
 console.log('[AUTO-LOGIN EXTENSION] cf-click.js loaded');
 

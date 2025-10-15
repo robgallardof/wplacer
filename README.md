@@ -1,8 +1,8 @@
 <h1 align="center"><p style="display: inline-flex; align-items: center; gap: 0.25em"><img style="width: 1.5em; height: 1.5em;" src="public/icons/favicon.png">wplacer</p></h1>
 
-<a href="LICENSE"><img src="https://img.shields.io/github/license/lllexxa/wplacer"></a>
+<a href="LICENSE"><img src="https://img.shields.io/github/license/robgallardof/wplacer"></a>
 <a href="https://discord.gg/qbtcWrHJvR"><img src="https://img.shields.io/badge/Support-gray?style=flat&logo=Discord&logoColor=white&logoSize=auto&labelColor=5562ea"></a>
-[![Views](https://hits.sh/github.com/lllexxa/wplacer.svg?label=Views&color=blue&style=flat)](https://hits.sh/github.com/lllexxa/wplacer/)
+[![Views](https://hits.sh/github.com/robgallardof/wplacer.svg?label=Views&color=blue&style=flat)](https://hits.sh/github.com/robgallardof/wplacer/)
 
 A massively updated auto-drawing bot for [wplace.live](https://wplace.live/).
 
@@ -47,10 +47,9 @@ A massively updated auto-drawing bot for [wplace.live](https://wplace.live/).
 ### Requirements:
 - [Node.js and NPM](https://nodejs.org/en/download)
 - [Tampermonkey](https://www.tampermonkey.net/)
-- [git](https://git-scm.com/downloads) (optional, but recommended)
 ### Installation:
 1. Install the extension on each browser window with an account you want to be used by wplacer and to automatically solve Turnstiles (CAPTCHAs) by going to the extensions page of your browser, turning on developer mode, pressing load unpacked, and then selecting the LOAD_UNPACKED folder included with wplacer.
-2. Download the repository using [git](https://git-scm.com/downloads) (`git clone https://github.com/lllexxa/wplacer.git`) or download the ZIP directly from GitHub (not recommended).
+2. Download the latest packaged build prepared by **KingGallardo** from the [releases page](https://github.com/robgallardof/wplacer/releases) and extract it locally.
 3. In the terminal, navigate to the project directory and install the dependencies with `npm i`.
 - If you'd like, you can change the host and port of the local server by creating a `.env` file.
 ### Usage:
@@ -73,7 +72,7 @@ A massively updated auto-drawing bot for [wplace.live](https://wplace.live/).
 
 -   [luluwaffless](https://github.com/luluwaffless)
 -   [Jinx](https://github.com/JinxTheCatto)
--   Fork maintainer: [lllexxa](https://github.com/lllexxa)
+-   Current maintainer: [KingGallardo](https://github.com/robgallardof)
 
 ### Original wplacer repository
 
