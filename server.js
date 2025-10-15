@@ -5,8 +5,7 @@
  * helper modules to keep concerns isolated.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
-import { appendFile } from 'node:fs/promises';
+import { existsSync, readFileSync, writeFileSync, mkdirSync} from 'node:fs';
 import { spawn, exec } from 'node:child_process';
 import path from 'node:path';
 import express from 'express';
@@ -98,20 +97,6 @@ const addToLiveLogs = (message, category = 'general', level = 'info') => {
 // Track open sockets to allow forced shutdown
 const sockets = new Set();
 
-// --- Logging & utils ---
-/**
- * Appends log content to disk without blocking the event loop when possible.
- *
- * @param {string} filePath Absolute path to the log file.
- * @param {string} content Text content to append.
- * @returns {Promise<void>}
- */
-const safeAppendFile = async (filePath, content) => {
-    try {
-        await appendFile(filePath, content);
-    } catch (_) {}
-};
-
 /**
  * Writes structured log messages to disk and the SSE feed while masking PII when configured.
  *
@@ -143,10 +128,6 @@ const log = async (id, name, data, error) => {
         const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}:`;
         console.error(outLine, error);
         const errText = `${error.stack || error.message}`;
-        await safeAppendFile(
-            path.join(DATA_DIR, `errors.log`),
-            `${outLine} ${maskOn ? maskMsg(errText) : errText}\n`
-        );
         try {
             const obj = {
                 line: `${outLine} ${maskOn ? maskMsg(errText) : errText}`,
@@ -178,7 +159,6 @@ const log = async (id, name, data, error) => {
             const identOut = maskOn ? maskMsg(identifier) : identifier;
             const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}`;
             console.log(outLine);
-            await safeAppendFile(path.join(DATA_DIR, `logs.log`), `${outLine}\n`);
             try {
                 const obj = { line: outLine, category: cat || 'general', level: 'info', ts: timestamp };
                 recentLogs.push(obj);
@@ -189,7 +169,6 @@ const log = async (id, name, data, error) => {
             const identOut = maskOn ? maskMsg(identifier) : identifier;
             const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}`;
             console.log(outLine);
-            await safeAppendFile(path.join(DATA_DIR, `logs.log`), `${outLine}\n`);
             try {
                 const obj = { line: outLine, category: 'general', level: 'info', ts: timestamp };
                 recentLogs.push(obj);
@@ -860,7 +839,6 @@ class WPlacer {
                         } catch (_) {}
                         // append as JSONL to avoid memory usage
                         const lines = pairs.map((o) => JSON.stringify(o)).join('\n') + '\n';
-                        appendFileSync(filePath, lines);
                         // enforce limit by truncating oldest when exceeding lines
                         try {
                             const limit = Math.max(0, Math.floor(Number(tpl.heatmapLimit || 10000))) || 10000;
@@ -3012,10 +2990,6 @@ app.get('/logs/stream', (req, res) => {
 app.use((err, req, res, next) => {
     try {
         console.error('[Express] error:', err?.message || err);
-        void safeAppendFile(
-            path.join(DATA_DIR, `errors.log`),
-            `[${new Date().toLocaleString()}] (Express) ${err?.stack || err}\n`
-        );
     } catch (_) {}
     if (res.headersSent) return next(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -5698,21 +5672,9 @@ app.get('/export-tokens', (req, res) => {
     try {
         process.on('uncaughtException', (err) => {
             console.error('[Process] uncaughtException:', err?.stack || err);
-            try {
-                appendFileSync(
-                    path.join(DATA_DIR, 'errors.log'),
-                    `[${new Date().toLocaleString()}] uncaughtException: ${err?.stack || err}\n`
-                );
-            } catch (_) {}
         });
         process.on('unhandledRejection', (reason) => {
             console.error('[Process] unhandledRejection:', reason);
-            try {
-                appendFileSync(
-                    path.join(DATA_DIR, 'errors.log'),
-                    `[${new Date().toLocaleString()}] unhandledRejection: ${reason}\n`
-                );
-            } catch (_) {}
         });
         const shutdown = () => {
             console.log('Shutting down server...');
