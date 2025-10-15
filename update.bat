@@ -102,31 +102,8 @@ if %errorlevel% equ 0 (
     echo.
 )
 
-echo Checking for remote changes...
-git fetch origin 2>&1
-if %errorlevel% neq 0 (
-    echo Warning: Could not fetch from remote repository.
-    echo Note: Without a successful fetch, 'git pull' will likely fail. Please check your internet connection and remote repository configuration.
-    echo.
-)
-
-echo Updating repository...
-git pull
-
-if %errorlevel% equ 0 (
-    echo.
-    echo Repository updated successfully!
-) else (
-    echo.
-    echo Error updating the repository.
-    echo Possible causes:
-    echo - No internet connection
-    echo - Authentication required
-    echo - Merge conflicts
-    echo - No remote repository configured
-    echo.
-    echo You may need to resolve conflicts manually or check your credentials.
-)
+echo Remote git updates have been disabled for this project.
+echo Please download the newest package published by KingGallardo from https://github.com/robgallardof/wplacer/releases and replace your local files manually.
 
 :end
 echo.

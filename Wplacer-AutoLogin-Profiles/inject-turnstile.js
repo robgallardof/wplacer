@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Injects a minimal Turnstile widget when backend.wplace.live
+ * requests a CAPTCHA challenge so the service worker can harvest tokens.
+ */
+
 // Inject a minimal page with Turnstile widget to obtain a token, then message SW
 console.log('[AUTO-LOGIN EXTENSION] inject-turnstile.js loaded');
 
@@ -34,6 +39,11 @@ console.log('[AUTO-LOGIN EXTENSION] inject-turnstile.js loaded');
     const origin = location.origin;
     const id = 'cf-turnstile-response';
 
+    /**
+     * Ensure the Cloudflare Turnstile library is present before rendering.
+     * @param {() => void} onReady Callback invoked once the script is ready.
+     * @returns {void}
+     */
     function ensureScript(onReady) {
       if (window.turnstile && window.turnstile.render) { onReady(); return; }
       const existing = document.getElementById('cf-turnstile-lib');
@@ -47,6 +57,10 @@ console.log('[AUTO-LOGIN EXTENSION] inject-turnstile.js loaded');
       document.documentElement.appendChild(s);
     }
 
+    /**
+     * Create and mount the Turnstile widget container in the current document.
+     * @returns {void}
+     */
     function renderWidget() {
       if (document.getElementById('wplace-turnstile')) return;
       const container = document.createElement('div');

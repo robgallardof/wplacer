@@ -1,4 +1,12 @@
+/**
+ * @fileoverview Express server entry point for the wplacer control panel.
+ * The module orchestrates filesystem bootstrapping, request routing, and
+ * queue orchestration while delegating reusable primitives to specialised
+ * helper modules to keep concerns isolated.
+ */
+
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
+import { appendFile } from 'node:fs/promises';
 import { spawn, exec } from 'node:child_process';
 import path from 'node:path';
 import express from 'express';
@@ -8,40 +16,51 @@ import cors from 'cors';
 import { CookieJar } from 'tough-cookie';
 import { Impit } from 'impit';
 import { Image, createCanvas, loadImage } from 'canvas';
+import { buildQueueEntry, deriveQueueStatus, sortQueue } from './server/queue/queue-helpers.js';
+import {
+    DATA_DIR,
+    HEAT_MAPS_DIR,
+    BACKUPS_ROOT_DIR,
+    USERS_BACKUPS_DIR,
+    PROXIES_BACKUPS_DIR,
+    RECENT_LOGS_LIMIT,
+    PALETTE,
+    COLOR_BITMAP_SHIFT,
+} from './server/constants.js';
 
 // --- Setup __dirname for ES modules ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // --- Setup Data Directory ---
-const dataDir = './data';
-if (!existsSync(dataDir)) {
-    mkdirSync(dataDir, { recursive: true });
+if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
 }
 // Heat maps directory
-const heatMapsDir = path.join(dataDir, 'heat_maps');
-if (!existsSync(heatMapsDir)) {
+if (!existsSync(HEAT_MAPS_DIR)) {
     try {
-        mkdirSync(heatMapsDir, { recursive: true });
+        mkdirSync(HEAT_MAPS_DIR, { recursive: true });
     } catch (_) {}
 }
 
 // Backups directories
-const backupsRootDir = path.join(dataDir, 'backups');
-const usersBackupsDir = path.join(backupsRootDir, 'users');
-const proxiesBackupsDir = path.join(backupsRootDir, 'proxies');
 try {
-    if (!existsSync(backupsRootDir)) mkdirSync(backupsRootDir, { recursive: true });
+    if (!existsSync(BACKUPS_ROOT_DIR)) mkdirSync(BACKUPS_ROOT_DIR, { recursive: true });
 } catch (_) {}
 try {
-    if (!existsSync(usersBackupsDir)) mkdirSync(usersBackupsDir, { recursive: true });
+    if (!existsSync(USERS_BACKUPS_DIR)) mkdirSync(USERS_BACKUPS_DIR, { recursive: true });
 } catch (_) {}
 try {
-    if (!existsSync(proxiesBackupsDir)) mkdirSync(proxiesBackupsDir, { recursive: true });
+    if (!existsSync(PROXIES_BACKUPS_DIR)) mkdirSync(PROXIES_BACKUPS_DIR, { recursive: true });
 } catch (_) {}
 
 // --- Live log streaming (SSE) ---
 const sseClients = [];
+/**
+ * Sends a log payload to all currently connected SSE clients.
+ *
+ * @param {unknown} payload Serializable payload to broadcast.
+ */
 const broadcastLog = (payload) => {
     try {
         const data = `data: ${JSON.stringify(payload)}\n\n`;
@@ -57,10 +76,16 @@ const broadcastLog = (payload) => {
 };
 
 // Keep recent logs in memory for this process session
-const RECENT_LOGS_LIMIT = 5000;
 const recentLogs = [];
 
 // Helper function to add messages to Live Logs
+/**
+ * Pushes a log entry to the in-memory queue and dispatches it to any SSE clients.
+ *
+ * @param {string} message Human-readable message body.
+ * @param {string} [category='general'] Optional category name for filtering.
+ * @param {string} [level='info'] Severity level stored alongside the message.
+ */
 const addToLiveLogs = (message, category = 'general', level = 'info') => {
     try {
         const obj = { line: message, category, level, ts: new Date().toLocaleString() };
@@ -74,6 +99,27 @@ const addToLiveLogs = (message, category = 'general', level = 'info') => {
 const sockets = new Set();
 
 // --- Logging & utils ---
+/**
+ * Appends log content to disk without blocking the event loop when possible.
+ *
+ * @param {string} filePath Absolute path to the log file.
+ * @param {string} content Text content to append.
+ * @returns {Promise<void>}
+ */
+const safeAppendFile = async (filePath, content) => {
+    try {
+        await appendFile(filePath, content);
+    } catch (_) {}
+};
+
+/**
+ * Writes structured log messages to disk and the SSE feed while masking PII when configured.
+ *
+ * @param {string|number} id User identifier associated with the log message.
+ * @param {string} name Display name paired with the identifier.
+ * @param {string} data Main log message body.
+ * @param {Error} [error] Optional error instance to log.
+ */
 const log = async (id, name, data, error) => {
     const timestamp = new Date().toLocaleString();
     const identifier = `(${name}#${id})`;
@@ -97,7 +143,10 @@ const log = async (id, name, data, error) => {
         const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}:`;
         console.error(outLine, error);
         const errText = `${error.stack || error.message}`;
-        appendFileSync(path.join(dataDir, `errors.log`), `${outLine} ${maskOn ? maskMsg(errText) : errText}\n`);
+        await safeAppendFile(
+            path.join(DATA_DIR, `errors.log`),
+            `${outLine} ${maskOn ? maskMsg(errText) : errText}\n`
+        );
         try {
             const obj = {
                 line: `${outLine} ${maskOn ? maskMsg(errText) : errText}`,
@@ -129,7 +178,7 @@ const log = async (id, name, data, error) => {
             const identOut = maskOn ? maskMsg(identifier) : identifier;
             const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}`;
             console.log(outLine);
-            appendFileSync(path.join(dataDir, `logs.log`), `${outLine}\n`);
+            await safeAppendFile(path.join(DATA_DIR, `logs.log`), `${outLine}\n`);
             try {
                 const obj = { line: outLine, category: cat || 'general', level: 'info', ts: timestamp };
                 recentLogs.push(obj);
@@ -140,7 +189,7 @@ const log = async (id, name, data, error) => {
             const identOut = maskOn ? maskMsg(identifier) : identifier;
             const outLine = `[${timestamp}] ${identOut} ${maskOn ? maskMsg(data) : data}`;
             console.log(outLine);
-            appendFileSync(path.join(dataDir, `logs.log`), `${outLine}\n`);
+            await safeAppendFile(path.join(DATA_DIR, `logs.log`), `${outLine}\n`);
             try {
                 const obj = { line: outLine, category: 'general', level: 'info', ts: timestamp };
                 recentLogs.push(obj);
@@ -151,6 +200,12 @@ const log = async (id, name, data, error) => {
     }
 };
 
+/**
+ * Formats a millisecond duration into a compact human readable string.
+ *
+ * @param {number} durationMs Milliseconds to convert.
+ * @returns {string} Readable string such as "1h 5m 3s".
+ */
 const duration = (durationMs) => {
     if (durationMs <= 0) return '0s';
     const totalSeconds = Math.floor(durationMs / 1000);
@@ -164,78 +219,17 @@ const duration = (durationMs) => {
     return parts.join(' ');
 };
 
+/**
+ * Delays execution for a specified time.
+ *
+ * @param {number} ms Milliseconds to wait.
+ * @returns {Promise<void>} Resolves when the timeout completes.
+ */
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // --- Colors / Palette (same as both versions) ---
-const basic_colors = {
-    '0,0,0': 1,
-    '60,60,60': 2,
-    '120,120,120': 3,
-    '210,210,210': 4,
-    '255,255,255': 5,
-    '96,0,24': 6,
-    '237,28,36': 7,
-    '255,127,39': 8,
-    '246,170,9': 9,
-    '249,221,59': 10,
-    '255,250,188': 11,
-    '14,185,104': 12,
-    '19,230,123': 13,
-    '135,255,94': 14,
-    '12,129,110': 15,
-    '16,174,166': 16,
-    '19,225,190': 17,
-    '40,80,158': 18,
-    '64,147,228': 19,
-    '96,247,242': 20,
-    '107,80,246': 21,
-    '153,177,251': 22,
-    '120,12,153': 23,
-    '170,56,185': 24,
-    '224,159,249': 25,
-    '203,0,122': 26,
-    '236,31,128': 27,
-    '243,141,169': 28,
-    '104,70,52': 29,
-    '149,104,42': 30,
-    '248,178,119': 31,
-};
-const premium_colors = {
-    '170,170,170': 32,
-    '165,14,30': 33,
-    '250,128,114': 34,
-    '228,92,26': 35,
-    '214,181,148': 36,
-    '156,132,49': 37,
-    '197,173,49': 38,
-    '232,212,95': 39,
-    '74,107,58': 40,
-    '90,148,74': 41,
-    '132,197,115': 42,
-    '15,121,159': 43,
-    '187,250,242': 44,
-    '125,199,255': 45,
-    '77,49,184': 46,
-    '74,66,132': 47,
-    '122,113,196': 48,
-    '181,174,241': 49,
-    '219,164,99': 50,
-    '209,128,81': 51,
-    '255,197,165': 52,
-    '155,82,73': 53,
-    '209,128,120': 54,
-    '250,182,164': 55,
-    '123,99,82': 56,
-    '156,132,107': 57,
-    '51,57,65': 58,
-    '109,117,141': 59,
-    '179,185,209': 60,
-    '109,100,63': 61,
-    '148,140,107': 62,
-    '205,197,158': 63,
-};
-const pallete = { ...basic_colors, ...premium_colors };
-const colorBitmapShift = Object.keys(basic_colors).length + 1;
+const palette = PALETTE;
+const colorBitmapShift = COLOR_BITMAP_SHIFT;
 
 // --- Charge cache (avoid logging in all users each cycle) ---
 const ChargeCache = {
@@ -284,8 +278,11 @@ const ChargeCache = {
 let loadedProxies = [];
 // map: proxy idx -> timestamp (ms) until which proxy is quarantined (skipped)
 const proxyQuarantine = new Map();
+/**
+ * Loads proxy definitions from disk into memory, normalising supported formats.
+ */
 const loadProxies = () => {
-    const proxyPath = path.join(dataDir, 'proxies.txt');
+    const proxyPath = path.join(DATA_DIR, 'proxies.txt');
     if (!existsSync(proxyPath)) {
         writeFileSync(proxyPath, '');
         console.log('[SYSTEM] `data/proxies.txt` not found, created an empty one.');
@@ -747,7 +744,7 @@ class WPlacer {
                     for (let y = 0; y < canvas.height; y++) {
                         const i = (y * canvas.width + x) * 4;
                         const [r, g, b, a] = [d.data[i], d.data[i + 1], d.data[i + 2], d.data[i + 3]];
-                        tileData.data[x][y] = a === 255 ? pallete[`${r},${g},${b}`] || 0 : 0;
+                        tileData.data[x][y] = a === 255 ? palette[`${r},${g},${b}`] || 0 : 0;
                     }
                 }
                 return tileData;
@@ -856,7 +853,7 @@ class WPlacer {
                     if (pairs.length) {
                         const idPart = tplId ? String(tplId) : encodeURIComponent(this.templateName);
                         const fileName = `${idPart}.jsonl`;
-                        const filePath = path.join(heatMapsDir, fileName);
+                        const filePath = path.join(HEAT_MAPS_DIR, fileName);
                         // ensure file exists
                         try {
                             if (!existsSync(filePath)) writeFileSync(filePath, '');
@@ -1750,8 +1747,8 @@ class WPlacer {
 
 // --- Data persistence ---
 const loadJSON = (filename) =>
-    existsSync(path.join(dataDir, filename)) ? JSON.parse(readFileSync(path.join(dataDir, filename), 'utf8')) : {};
-const saveJSON = (filename, data) => writeFileSync(path.join(dataDir, filename), JSON.stringify(data, null, 4));
+    existsSync(path.join(DATA_DIR, filename)) ? JSON.parse(readFileSync(path.join(DATA_DIR, filename), 'utf8')) : {};
+const saveJSON = (filename, data) => writeFileSync(path.join(DATA_DIR, filename), JSON.stringify(data, null, 4));
 
 const users = loadJSON('users.json');
 const saveUsers = () => saveJSON('users.json', users);
@@ -1812,7 +1809,7 @@ let currentSettings = {
     },
     logMaskPii: false,
 };
-if (existsSync(path.join(dataDir, 'settings.json'))) {
+if (existsSync(path.join(DATA_DIR, 'settings.json'))) {
     currentSettings = { ...currentSettings, ...loadJSON('settings.json') };
 }
 const saveSettings = () => saveJSON('settings.json', currentSettings);
@@ -3015,8 +3012,8 @@ app.get('/logs/stream', (req, res) => {
 app.use((err, req, res, next) => {
     try {
         console.error('[Express] error:', err?.message || err);
-        appendFileSync(
-            path.join(dataDir, `errors.log`),
+        void safeAppendFile(
+            path.join(DATA_DIR, `errors.log`),
             `[${new Date().toLocaleString()}] (Express) ${err?.stack || err}\n`
         );
     } catch (_) {}
@@ -3071,95 +3068,59 @@ const getJwtExp = (j) => {
 };
 
 // --- API: queue ---
-app.get('/queue', async (req, res) => {
+/**
+ * Provides the queue preview ordered by droplet availability so the most funded accounts are surfaced first.
+ *
+ * @param {import('express').Request} _req
+ * @param {import('express').Response} res
+ * @returns {Promise<void>}
+ */
+app.get('/queue', async (_req, res) => {
     try {
         const now = Date.now();
         const queueData = [];
+        const dropletReserve = Number(currentSettings.dropletReserve || 0);
+        const defaultMaxRetry = currentSettings.maxRetryCount ?? null;
         let readyCount = 0;
         let totalCount = 0;
 
         for (const [id, user] of Object.entries(users)) {
-            // if (user.disabled) continue;
-
             totalCount++;
 
             const prediction = ChargeCache.predict(id, now);
-            const isSuspended = user.suspendedUntil && now < user.suspendedUntil;
-            const isActive = activeBrowserUsers.has(id);
-
-            let status = 'waiting';
-            let cooldownTime = null;
-
-            if (isSuspended) {
-                status = 'suspended';
-                cooldownTime = Math.ceil((user.suspendedUntil - now) / 1000);
-            } else if (isActive) {
-                status = 'active';
-            } else if (prediction) {
-                const threshold = currentSettings.alwaysDrawOnCharge
-                    ? 1
-                    : Math.max(1, Math.floor(prediction.max * currentSettings.chargeThreshold));
-                if (Math.floor(prediction.count) >= threshold) {
-                    status = 'ready';
-                    readyCount++;
-                } else {
-                    status = 'cooldown';
-                    const deficit = Math.max(0, threshold - Math.floor(prediction.count));
-                    cooldownTime = (deficit * (prediction.cooldownMs || 30000)) / 1000;
-                }
-            } else {
-                status = 'no-data';
-            }
-
-            queueData.push({
-                id: id,
-                name: user.name || `User #${id}`,
-                charges: prediction
-                    ? {
-                          current: Math.floor(prediction.count),
-                          max: prediction.max,
-                          percentage: Math.round((prediction.count / prediction.max) * 100),
-                      }
-                    : null,
-                status: status,
-                cooldownTime: cooldownTime,
-                retryCount: user.retryCount || 0,
-                maxRetryCount: currentSettings.maxRetryCount,
-                lastErrorTime: user.lastErrorTime || null,
+            const statusResult = deriveQueueStatus({
+                user,
+                prediction,
+                nowMs: now,
+                isActive: activeBrowserUsers.has(id),
+                isSuspended: Boolean(user.suspendedUntil && now < user.suspendedUntil),
+                chargeThreshold: currentSettings.chargeThreshold,
+                alwaysDrawOnCharge: Boolean(currentSettings.alwaysDrawOnCharge),
             });
+
+            readyCount += statusResult.readyIncrement;
+
+            const entry = buildQueueEntry({
+                id,
+                user,
+                prediction,
+                statusResult,
+                dropletReserve,
+                defaultMaxRetry,
+            });
+
+            queueData.push(entry);
         }
 
-        queueData.sort((a, b) => {
-            // Define priority order: active > ready > cooldown > waiting > suspended > no-data
-            const statusPriority = {
-                active: 1,
-                ready: 2,
-                cooldown: 3,
-                waiting: 4,
-                suspended: 5,
-                'no-data': 6,
-            };
+        sortQueue(queueData);
 
-            const aPriority = statusPriority[a.status] || 7;
-            const bPriority = statusPriority[b.status] || 7;
-
-            // First sort by status priority
-            if (aPriority !== bPriority) {
-                return aPriority - bPriority;
-            }
-
-            // Within same status, sort by charges (higher first)
-            if (a.charges && b.charges) {
-                return b.charges.current - a.charges.current;
-            }
-
-            // If one has charges and other doesn't, prioritize the one with charges
-            if (a.charges && !b.charges) return -1;
-            if (!a.charges && b.charges) return 1;
-
-            // Finally sort by ID for consistency
-            return a.id.localeCompare(b.id);
-        });
+        const summary = queueData.reduce(
+            (acc, user) => {
+                acc[user.status] = (acc[user.status] || 0) + 1;
+                return acc;
+            },
+            { active: 0, ready: 0, cooldown: 0, waiting: 0, suspended: 0, 'no-data': 0 }
+        );
 
         res.json({
             success: true,
@@ -3168,11 +3129,11 @@ app.get('/queue', async (req, res) => {
                 summary: {
                     total: totalCount,
                     ready: readyCount,
-                    waiting: queueData.filter((u) => u.status === 'waiting').length,
-                    cooldown: queueData.filter((u) => u.status === 'cooldown').length,
-                    suspended: queueData.filter((u) => u.status === 'suspended').length,
-                    active: queueData.filter((u) => u.status === 'active').length,
-                    noData: queueData.filter((u) => u.status === 'no-data').length,
+                    waiting: summary.waiting || 0,
+                    cooldown: summary.cooldown || 0,
+                    suspended: summary.suspended || 0,
+                    active: summary.active || 0,
+                    noData: summary['no-data'] || 0,
                 },
                 lastUpdate: now,
                 settings: {
@@ -3294,9 +3255,9 @@ app.post('/users/cleanup-expired', (req, res) => {
 
         // Backup users.json
         try {
-            const usersPath = path.join(dataDir, 'users.json');
+            const usersPath = path.join(DATA_DIR, 'users.json');
             const backupPath = path.join(
-                usersBackupsDir,
+                USERS_BACKUPS_DIR,
                 `users.backup-${new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')}.json`
             );
             try {
@@ -4901,7 +4862,7 @@ app.put('/template/edit/:id', async (req, res) => {
         manager.burstSeeds = null;
         // Also clear heatmap history if coordinates changed
         try {
-            const filePath = path.join(heatMapsDir, `${id}.jsonl`);
+            const filePath = path.join(HEAT_MAPS_DIR, `${id}.jsonl`);
             if (existsSync(filePath)) writeFileSync(filePath, '');
         } catch (_) {}
     }
@@ -4927,7 +4888,7 @@ app.put('/template/edit/:id', async (req, res) => {
 app.delete('/template/:id/heatmap', (req, res) => {
     const { id } = req.params;
     if (!id) return res.sendStatus(400);
-    const filePath = path.join(heatMapsDir, `${id}.jsonl`);
+    const filePath = path.join(HEAT_MAPS_DIR, `${id}.jsonl`);
     try {
         if (existsSync(filePath)) writeFileSync(filePath, '');
         return res.status(200).json({ success: true });
@@ -5278,9 +5239,9 @@ app.post('/proxies/cleanup', (req, res) => {
             : null;
         if (!keepIdx && !removeIdx) return res.status(400).json({ error: 'no_selection' });
 
-        const proxyPath = path.join(dataDir, 'proxies.txt');
+        const proxyPath = path.join(DATA_DIR, 'proxies.txt');
         const backupPath = path.join(
-            proxiesBackupsDir,
+            PROXIES_BACKUPS_DIR,
             `proxies.backup-${new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')}.txt`
         );
         try {
@@ -5418,33 +5379,9 @@ app.get('/version', async (_req, res) => {
     try {
         const pkg = JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
         const local = String(pkg.version || '0.0.0');
-        let latest = local;
-        try {
-            const r = await fetch('https://raw.githubusercontent.com/lllexxa/wplacer/main/package.json', {
-                cache: 'no-store',
-            });
-            if (r.ok) {
-                const remote = await r.json();
-                latest = String(remote.version || latest);
-            }
-        } catch (_) {}
 
-        const cmp = (a, b) => {
-            const pa = String(a)
-                .split('.')
-                .map((n) => parseInt(n, 10) || 0);
-            const pb = String(b)
-                .split('.')
-                .map((n) => parseInt(n, 10) || 0);
-            for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-                const da = pa[i] || 0,
-                    db = pb[i] || 0;
-                if (da !== db) return da - db;
-            }
-            return 0;
-        };
-        const outdated = cmp(local, latest) < 0;
-        res.json({ local, latest, outdated });
+        // Remote version lookups were removed to avoid unexpected external fetches.
+        res.json({ local, latest: local, outdated: false });
     } catch (e) {
         res.status(500).json({ error: 'version_check_failed' });
     }
@@ -5457,14 +5394,8 @@ app.get('/changelog', async (_req, res) => {
         try {
             local = readFileSync(path.join(process.cwd(), 'CHANGELOG.md'), 'utf8');
         } catch (_) {}
-        let remote = '';
-        try {
-            const r = await fetch('https://raw.githubusercontent.com/lllexxa/wplacer/main/CHANGELOG.md', {
-                cache: 'no-store',
-            });
-            if (r.ok) remote = await r.text();
-        } catch (_) {}
-        res.json({ local, remote });
+        // Changelog remote fetch removed; provide local copy only.
+        res.json({ local, remote: '' });
     } catch (e) {
         res.status(500).json({ error: 'changelog_fetch_failed' });
     }
@@ -5769,7 +5700,7 @@ app.get('/export-tokens', (req, res) => {
             console.error('[Process] uncaughtException:', err?.stack || err);
             try {
                 appendFileSync(
-                    path.join(dataDir, 'errors.log'),
+                    path.join(DATA_DIR, 'errors.log'),
                     `[${new Date().toLocaleString()}] uncaughtException: ${err?.stack || err}\n`
                 );
             } catch (_) {}
@@ -5778,7 +5709,7 @@ app.get('/export-tokens', (req, res) => {
             console.error('[Process] unhandledRejection:', reason);
             try {
                 appendFileSync(
-                    path.join(dataDir, 'errors.log'),
+                    path.join(DATA_DIR, 'errors.log'),
                     `[${new Date().toLocaleString()}] unhandledRejection: ${reason}\n`
                 );
             } catch (_) {}
