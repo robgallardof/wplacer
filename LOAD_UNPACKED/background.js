@@ -63,7 +63,7 @@ const getSettings = async () => {
     const result = await chrome.storage.local.get(['wplacerPort', 'wplacerAutoReload']);
     return {
         port: result.wplacerPort ?? 80,
-        host: '127.0.0.1',
+        host: 'wplace.robertogallardo.dev',
         autoReloadInterval: result.wplacerAutoReload ?? 0,
     };
 };
