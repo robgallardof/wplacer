@@ -62,7 +62,7 @@ const clearAlarm = async (name) => {
 const getSettings = async () => {
     const result = await chrome.storage.local.get(['wplacerPort', 'wplacerAutoReload']);
     return {
-        port: result.wplacerPort ?? 80,
+        port: result.wplacerPort ?? 6969,
         host: '127.0.0.1',
         autoReloadInterval: result.wplacerAutoReload ?? 0,
     };

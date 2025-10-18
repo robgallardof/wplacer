@@ -86,7 +86,7 @@ function ensureOverlay() {
       <div>Send: <span id="wplace-send">-</span></div>
       <div style="display:flex;align-items:center;gap:8px;">
         <span>Port:</span>
-        <input id="wplace-port" type="number" min="1" max="65535" placeholder="80" style="width:100px;padding:6px 8px;border-radius:6px;border:1px solid #4b5563;background:#111827;color:#e5e7eb;" />
+        <input id="wplace-port" type="number" min="1" max="65535" placeholder="6969" style="width:100px;padding:6px 8px;border-radius:6px;border:1px solid #4b5563;background:#111827;color:#e5e7eb;" />
         <button id="wplace-save-port" style="padding:6px 10px;border-radius:6px;border:none;background:#4b5563;color:#fff;font-weight:600;cursor:pointer;">Save</button>
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
@@ -110,7 +110,7 @@ function ensureOverlay() {
   // Load port from storage
   try {
     chrome.storage.local.get(['wplacerPort'], (res) => {
-      const p = (res && res.wplacerPort) ? String(res.wplacerPort) : '80';
+      const p = (res && res.wplacerPort) ? String(res.wplacerPort) : '6969';
       const el = document.getElementById('wplace-port');
       if (el) el.value = p;
     });
@@ -187,7 +187,7 @@ function ensureOverlay() {
   document.getElementById('wplace-save-port').onclick = () => {
     try {
       const val = parseInt(document.getElementById('wplace-port').value, 10);
-      chrome.runtime.sendMessage({ type: 'wplace:set-port', port: isFinite(val) && val > 0 ? val : 80 });
+      chrome.runtime.sendMessage({ type: 'wplace:set-port', port: isFinite(val) && val > 0 ? val : 6969 });
     } catch {}
   };
   // Load and save profile meta (do not overwrite non-empty input)
