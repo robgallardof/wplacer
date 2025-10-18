@@ -6,12 +6,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const sendCookieBtn = document.getElementById('sendCookieBtn');
     const logoutBtn = document.getElementById('logoutBtn');
 
-    let initialPort = 6969;
+    let initialPort = 80;
     let initialAutoReload = 0;
 
     // Load current settings
     chrome.storage.local.get(['wplacerPort', 'wplacerAutoReload'], (result) => {
-        initialPort = result.wplacerPort || 6969;
+        initialPort = result.wplacerPort || 80;
         initialAutoReload = result.wplacerAutoReload || 0;
         portInput.value = initialPort;
         autoReloadInput.value = initialAutoReload;

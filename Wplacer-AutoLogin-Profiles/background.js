@@ -148,10 +148,10 @@ async function getCookieJAny() {
 async function getLocalServerUrl(path = '') {
     try {
         const { wplacerPort } = await chrome.storage.local.get(['wplacerPort']);
-        const port = wplacerPort || 6969;
+        const port = wplacerPort || 80;
         return `http://127.0.0.1:${port}${path}`;
     } catch {
-        return `http://127.0.0.1:6969${path}`;
+        return `http://127.0.0.1:80${path}`;
     }
 }
 
@@ -594,7 +594,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.type === 'wplace:set-port') {
             (async () => {
                 try {
-                    const port = typeof msg.port === 'number' && msg.port > 0 && msg.port <= 65535 ? msg.port : 6969;
+                    const port = typeof msg.port === 'number' && msg.port > 0 && msg.port <= 65535 ? msg.port : 80;
                     await chrome.storage.local.set({ wplacerPort: port });
                     try {
                         sendResponse && sendResponse({ ok: true, port });

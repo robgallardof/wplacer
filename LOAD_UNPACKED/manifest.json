@@ -14,8 +14,7 @@
   "host_permissions": [
     "https://wplace.live/",
     "https://backend.wplace.live/",
-    "http://127.0.0.1/*",
-    "https://robertogallardo.dev/*"
+    "http://127.0.0.1/*"
   ],
   "action": {
     "default_popup": "popup.html",

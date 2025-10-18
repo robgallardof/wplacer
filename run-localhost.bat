@@ -4,7 +4,7 @@ echo.
 
 REM Set HOST to localhost only
 set HOST=127.0.0.1
-set PORT=6969
+set PORT=80
 
 echo Using HOST=%HOST% and PORT=%PORT%
 echo.
