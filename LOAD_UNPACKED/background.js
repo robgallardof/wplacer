@@ -7,6 +7,9 @@ const COOKIE_ALARM_NAME = 'wplacer-cookie-alarm';
 const SAFETY_REFRESH_ALARM_NAME = 'wplacer-safety-refresh-alarm';
 const TOKEN_TIMEOUT_ALARM_NAME = 'wplacer-token-timeout-alarm';
 const AUTO_RELOAD_ALARM_NAME = 'wplacer-auto-reload-alarm';
+const FRONT_ORIGIN = 'https://wplace.live/';
+const BACKEND_ORIGIN = 'https://backend.wplace.live/';
+const AUTH_COOKIE_NAME = 'j';
 
 /** Internal state flags and timing constants */
 let LP_ACTIVE = false;
@@ -76,6 +79,61 @@ const getSettings = async () => {
 const getServerUrl = async (path = '') => {
     const { host, port } = await getSettings();
     return `http://${host}:${port}${path}`;
+};
+
+const setCookiePromise = (details) => new Promise((resolve, reject) => {
+    try {
+        chrome.cookies.set(details, (cookie) => {
+            const err = chrome.runtime.lastError;
+            if (err || !cookie) {
+                reject(new Error(err?.message || 'Failed to set cookie'));
+            } else {
+                resolve(cookie);
+            }
+        });
+    } catch (error) {
+        reject(error);
+    }
+});
+
+const setAuthCookieForUrl = async (url, value) => {
+    const base = {
+        url,
+        name: AUTH_COOKIE_NAME,
+        value,
+        path: '/',
+    };
+    try {
+        return await setCookiePromise({
+            ...base,
+            secure: true,
+            httpOnly: true,
+            sameSite: 'no_restriction',
+        });
+    } catch (error) {
+        console.warn('wplacer: strict cookie set failed, retrying without advanced flags for', url, error?.message || error);
+        return await setCookiePromise(base);
+    }
+};
+
+const normaliseAccountsList = (raw) => {
+    if (Array.isArray(raw)) {
+        return raw.filter((item) => item != null);
+    }
+    if (raw && typeof raw === 'object') {
+        return Object.values(raw).filter((item) => item != null);
+    }
+    return [];
+};
+
+const fetchStoredAccounts = async () => {
+    try {
+        const { wplacerAccounts } = await chrome.storage.local.get(['wplacerAccounts']);
+        return normaliseAccountsList(wplacerAccounts);
+    } catch (error) {
+        console.warn('wplacer: failed to read stored accounts', error?.message || error);
+        return [];
+    }
 };
 
 /**
@@ -495,6 +553,49 @@ const quickLogout = (callback) => {
 
 /** Message bus: handles one-off commands from content scripts / UI. */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'setAuthCookie') {
+        (async () => {
+            const value = typeof request.value === 'string' ? request.value : '';
+            if (!value) {
+                sendResponse?.({ ok: false, error: 'Empty cookie value' });
+                return;
+            }
+
+            try {
+                const results = await Promise.allSettled([
+                    setAuthCookieForUrl(BACKEND_ORIGIN, value),
+                    setAuthCookieForUrl(FRONT_ORIGIN, value),
+                ]);
+                const successes = results.filter((r) => r.status === 'fulfilled');
+                if (!successes.length) {
+                    const firstError = results.find((r) => r.status === 'rejected');
+                    throw firstError?.reason || new Error('Failed to set cookie');
+                }
+                if (successes.length < results.length) {
+                    console.warn('wplacer: cookie set partially succeeded', results);
+                }
+                sendResponse?.({ ok: true, partial: successes.length < results.length });
+            } catch (error) {
+                console.warn('wplacer: failed to set auth cookie', error?.message || error);
+                sendResponse?.({ ok: false, error: error?.message || 'Failed to set cookie' });
+            }
+        })();
+        return true;
+    }
+
+    if (request.action === 'getStoredAccounts') {
+        (async () => {
+            try {
+                const accounts = await fetchStoredAccounts();
+                sendResponse?.({ ok: true, accounts });
+            } catch (error) {
+                console.warn('wplacer: error retrieving stored accounts', error?.message || error);
+                sendResponse?.({ ok: false, accounts: [], error: error?.message || 'Failed to read accounts' });
+            }
+        })();
+        return true;
+    }
+
     if (request.action === 'sendCookie') {
         sendCookie(sendResponse);
         return true; // async

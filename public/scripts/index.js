@@ -46,6 +46,9 @@ const openAddTemplate = $("openAddTemplate");
 const openManageTemplates = $("openManageTemplates");
 const openSettings = $("openSettings");
 const openChangelog = $("openChangelog");
+const appNav = document.getElementById('primaryNav');
+const navToggle = document.querySelector('.menu-toggle');
+const navOverlay = document.querySelector('.app-nav-overlay');
 const userForm = $("userForm");
 const scookie = $("scookie");
 const jcookie = $("jcookie");
@@ -96,6 +99,74 @@ const submitTemplate = $("submitTemplate");
 const manageTemplates = $("manageTemplates");
 const templateList = $("templateList");
 const PINNED_TEMPLATES_KEY = PINNED_TEMPLATES_STORAGE_KEY || 'wplacer_pinned_templates_v1';
+
+if (appNav) {
+    appNav.setAttribute('tabindex', '-1');
+}
+
+if (appNav && navToggle) {
+    const mobileNavQuery = window.matchMedia('(max-width: 980px)');
+    const navButtons = Array.from(appNav.querySelectorAll('button'));
+
+    const setNavState = (open) => {
+        document.body.classList.toggle('nav-open', open);
+        navToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+
+        if (mobileNavQuery.matches && appNav) {
+            appNav.setAttribute('aria-hidden', open ? 'false' : 'true');
+        } else if (appNav) {
+            appNav.removeAttribute('aria-hidden');
+        }
+    };
+
+    const closeNav = () => setNavState(false);
+
+    navToggle.addEventListener('click', () => {
+        const willOpen = !document.body.classList.contains('nav-open');
+        setNavState(willOpen);
+        if (willOpen && appNav) {
+            appNav.focus({ preventScroll: true });
+        }
+    });
+
+    if (navOverlay) {
+        navOverlay.addEventListener('click', closeNav);
+    }
+
+    navButtons.forEach((btn) => {
+        btn.addEventListener('click', () => {
+            if (mobileNavQuery.matches) {
+                closeNav();
+            }
+        });
+    });
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && document.body.classList.contains('nav-open')) {
+            closeNav();
+            navToggle.focus();
+        }
+    });
+
+    const handleNavQueryChange = () => {
+        if (!mobileNavQuery.matches) {
+            setNavState(false);
+            if (appNav) {
+                appNav.removeAttribute('aria-hidden');
+            }
+        } else if (appNav) {
+            appNav.setAttribute('aria-hidden', document.body.classList.contains('nav-open') ? 'false' : 'true');
+        }
+    };
+
+    if (typeof mobileNavQuery.addEventListener === 'function') {
+        mobileNavQuery.addEventListener('change', handleNavQueryChange);
+    } else if (typeof mobileNavQuery.addListener === 'function') {
+        mobileNavQuery.addListener(handleNavQueryChange);
+    }
+
+    handleNavQueryChange();
+}
 /**
  * Reads pinned template identifiers from localStorage.
  *

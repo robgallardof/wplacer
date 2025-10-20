@@ -12,6 +12,16 @@ if (sessionStorage.getItem(RELOAD_FLAG)) {
 
 const sentTokens = new Set();
 const pending = { turnstile: null, pawtect: null };
+const USERSCRIPT_SOURCE = 'my-userscript';
+const EXTENSION_SOURCE = 'extension';
+
+const postToPage = (payload) => {
+    try {
+        window.postMessage({ source: EXTENSION_SOURCE, ...payload }, '*');
+    } catch (error) {
+        console.warn('wplacer: failed to post message to page script', error);
+    }
+};
 
 const trySendPair = () => {
     if (!pending.turnstile || !pending.pawtect) return;
@@ -91,6 +101,65 @@ window.addEventListener('message', (event) => {
         }
     } catch {}
 }, true);
+
+window.addEventListener('message', (event) => {
+    try {
+        if (event.source !== window) return;
+        const data = event.data;
+        if (!data || data.source !== USERSCRIPT_SOURCE) return;
+
+        if (data.type === 'setCookie') {
+            const rawValue = typeof data.value === 'string' ? data.value : '';
+            if (!rawValue) {
+                postToPage({ type: 'cookieSetError', error: 'Missing cookie value' });
+                return;
+            }
+
+            chrome.runtime.sendMessage(
+                { action: 'setAuthCookie', value: rawValue },
+                (response) => {
+                    const runtimeError = chrome.runtime.lastError;
+                    if (runtimeError) {
+                        postToPage({
+                            type: 'cookieSetError',
+                            error: runtimeError.message || 'Extension unavailable',
+                        });
+                        return;
+                    }
+
+                    if (response && response.ok) {
+                        postToPage({ type: 'cookieSet' });
+                    } else {
+                        postToPage({
+                            type: 'cookieSetError',
+                            error: (response && response.error) || 'Failed to set cookie',
+                        });
+                    }
+                }
+            );
+        } else if (data.type === 'getAccounts') {
+            chrome.runtime.sendMessage({ action: 'getStoredAccounts' }, (response) => {
+                const runtimeError = chrome.runtime.lastError;
+                if (runtimeError) {
+                    postToPage({
+                        type: 'accountsData',
+                        accounts: [],
+                        error: runtimeError.message || 'Extension unavailable',
+                    });
+                    return;
+                }
+
+                const accounts = Array.isArray(response?.accounts)
+                    ? response.accounts
+                    : [];
+
+                postToPage({ type: 'accountsData', accounts });
+            });
+        }
+    } catch (error) {
+        console.warn('wplacer: failed to process page bridge message', error);
+    }
+});
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "reloadForToken") {
