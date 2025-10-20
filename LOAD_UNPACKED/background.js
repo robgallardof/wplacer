@@ -4,7 +4,6 @@
  */
 const POLL_ALARM_NAME = 'wplacer-poll-alarm';
 const COOKIE_ALARM_NAME = 'wplacer-cookie-alarm';
-const SAFETY_REFRESH_ALARM_NAME = 'wplacer-safety-refresh-alarm';
 const TOKEN_TIMEOUT_ALARM_NAME = 'wplacer-token-timeout-alarm';
 const AUTO_RELOAD_ALARM_NAME = 'wplacer-auto-reload-alarm';
 const FRONT_ORIGIN = 'https://wplace.live/';
@@ -23,9 +22,12 @@ const TOKEN_TIMEOUT_MS = 25000;
 /** Fast-retry spacing and cap. */
 const FAST_RETRY_DELAY_MS = 7000;
 const FAST_RETRY_MAX = 3;
+const BRIDGE_FAILURE_THRESHOLD = 3;
+const BRIDGE_RETRY_DELAY_MS = 1500;
 
 let TOKEN_TIMEOUT_ID = null;
 let fastRetriesLeft = 0;
+let consecutiveBridgeFailures = 0;
 
 /**
  * Sleep helper.
@@ -64,7 +66,7 @@ const isRetryableMessagingError = (error) => {
  * @returns {Promise<boolean>} true when the content script confirmed it will
  *   handle the request without a reload.
  */
-const requestTokenViaContent = async (tabId, attempts = 3) => {
+const requestTokenViaContent = async (tabId, attempts = 5) => {
     for (let attempt = 0; attempt < attempts; attempt++) {
         try {
             const response = await chrome.tabs.sendMessage(tabId, { action: 'reloadForToken' });
@@ -274,6 +276,7 @@ const clearTokenWait = () => {
     clearTokenTimeout();
     TOKEN_IN_PROGRESS = false;
     fastRetriesLeft = 0;
+    consecutiveBridgeFailures = 0;
 };
 
 /**
@@ -508,39 +511,45 @@ const initiateReload = async () => {
         } catch {}
         await wait(150);
 
-        console.log(`wplacer: Sending reload command to tab #${targetTab.id}`);
+        console.log(`wplacer: Requesting token bridge on tab #${targetTab.id}`);
         const handledByContent = await requestTokenViaContent(targetTab.id);
 
-        if (!handledByContent) {
-            LAST_RELOAD_AT = Date.now();
-            // Ensure reload even if content script didn't handle the message.
-            setTimeout(async () => {
-                try {
-                    await chrome.tabs.update(targetTab.id, { active: true });
-                } catch {}
-                try {
-                    await chrome.tabs.reload(targetTab.id, { bypassCache: true });
-                } catch {
-                    try {
-                        const base = (targetTab.url || 'https://wplace.live/').replace(/[#?]$/, '');
-                        const url = base + (base.includes('?') ? '&' : '?') + 'wplacer=' + Date.now();
-                        await chrome.tabs.update(targetTab.id, { url });
-                    } catch {}
-                }
-                // Second shot after ~1.5s if it didn't start loading
-                setTimeout(async () => {
-                    try {
-                        const t = await chrome.tabs.get(targetTab.id);
-                        if (t.status !== 'loading') {
-                            await chrome.tabs.reload(targetTab.id, { bypassCache: true });
-                        }
-                    } catch {}
-                }, 1500);
-            }, 200);
-        } else {
+        if (handledByContent) {
+            consecutiveBridgeFailures = 0;
             console.log(`wplacer: Content script is handling token generation without reload for tab #${targetTab.id}.`);
             return;
         }
+
+        consecutiveBridgeFailures += 1;
+        console.warn(
+            `wplacer: Token bridge did not respond (attempt ${consecutiveBridgeFailures}/${BRIDGE_FAILURE_THRESHOLD}).`
+        );
+
+        if (consecutiveBridgeFailures >= BRIDGE_FAILURE_THRESHOLD) {
+            console.warn('wplacer: Falling back to a guarded tab reload after repeated bridge failures.');
+            consecutiveBridgeFailures = 0;
+            LAST_RELOAD_AT = Date.now();
+            try {
+                await chrome.tabs.update(targetTab.id, { active: true });
+            } catch {}
+            try {
+                await chrome.tabs.reload(targetTab.id, { bypassCache: true });
+            } catch {
+                try {
+                    const base = (targetTab.url || 'https://wplace.live/').replace(/[#?]$/, '');
+                    const url = base + (base.includes('?') ? '&' : '?') + 'wplacer=' + Date.now();
+                    await chrome.tabs.update(targetTab.id, { url });
+                } catch {}
+            }
+            return;
+        }
+
+        clearTokenTimeout();
+        TOKEN_IN_PROGRESS = false;
+        setTimeout(() => {
+            maybeInitiateReload().catch(() => {});
+        }, BRIDGE_RETRY_DELAY_MS);
+        return;
     } catch (error) {
         console.error('wplacer: Error sending reload message to tab, falling back to direct reload.', error);
         const tabs = await chrome.tabs.query({ url: 'https://wplace.live/*' });
@@ -1268,7 +1277,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 /**
- * Alarm dispatcher for polling, cookie refresh, safety refresh, token timeout backup,
+ * Alarm dispatcher for polling, cookie refresh, token-timeout backups,
  * and optional user-configured auto-reload.
  */
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -1282,25 +1291,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === POLL_ALARM_NAME) {
         if (!LP_ACTIVE) startLongPoll();
         pollForTokenRequest();
-        return;
-    }
-    if (alarm.name === SAFETY_REFRESH_ALARM_NAME) {
-        // Safety net: force refresh wplace tabs every ~45s if not already refreshing
-        (async () => {
-            try {
-                if (TOKEN_IN_PROGRESS) return;
-                const now = Date.now();
-                if (now - LAST_RELOAD_AT < 45000) return;
-                const tabs = await chrome.tabs.query({ url: 'https://wplace.live/*' });
-                for (const tab of tabs || []) {
-                    try {
-                        await injectPawtectIntoTab(tab.id);
-                        await chrome.tabs.reload(tab.id, { bypassCache: true });
-                    } catch {}
-                }
-                LAST_RELOAD_AT = Date.now();
-            } catch {}
-        })();
         return;
     }
     if (alarm.name === TOKEN_TIMEOUT_ALARM_NAME) {
@@ -1323,7 +1313,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 /**
- * Initializes recurring alarms: polling, cookie refresh, safety refresh,
+ * Initializes recurring alarms: polling, cookie refresh,
  * and user-configured auto-reload.
  * @returns {Promise<void>}
  */
@@ -1336,10 +1326,6 @@ const initializeAlarms = async () => {
         await chrome.alarms.create(COOKIE_ALARM_NAME, {
             delayInMinutes: 1,
             periodInMinutes: 20,
-        });
-        await chrome.alarms.create(SAFETY_REFRESH_ALARM_NAME, {
-            delayInMinutes: 1,
-            periodInMinutes: 1,
         });
         await updateAutoReloadAlarm();
         console.log('wplacer: Alarms initialized.');

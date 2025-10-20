@@ -187,8 +187,8 @@ const postToken = (token, pawtectToken) => {
     });
 };
 
-const BRIDGE_MAX_ATTEMPTS = 3;
-const BRIDGE_RETRY_DELAY_MS = 450;
+const BRIDGE_MAX_ATTEMPTS = 5;
+const BRIDGE_RETRY_DELAY_MS = 600;
 
 const requestTokenWithoutReload = async (force = true, timeoutMs = 7000, attempt = 0) => {
     const handled = await new Promise((resolve) => {
@@ -364,10 +364,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 try { sendResponse?.({ handled: true }); } catch {}
                 return;
             }
+            console.warn('wplacer: Token bridge unavailable after retries. Reporting back without forcing reload.');
             try { sendResponse?.({ handled: false }); } catch {}
-            console.log("wplacer: Token bridge unavailable. Falling back to reload.");
-            sessionStorage.setItem(RELOAD_FLAG, 'true');
-            location.reload();
         })();
         return true;
     }
