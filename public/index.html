@@ -41,6 +41,10 @@
 
     <!-- App Shell -->
     <header class="app-header">
+        <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="primaryNav">
+            <span class="menu-toggle__icon" aria-hidden="true"></span>
+            <span class="visually-hidden">Toggle navigation</span>
+        </button>
         <div class="brand">
             <img src="icons/favicon.png" alt="" aria-hidden="true" />
             <span>wplacer</span>
@@ -59,8 +63,9 @@
     </header>
 
     <div class="app-layout">
+        <div class="app-nav-overlay" data-close-nav></div>
         <!-- Persistent Nav -->
-        <aside class="app-nav" aria-label="Primary">
+        <aside class="app-nav" id="primaryNav" aria-label="Primary">
             <button class="nav-btn" onclick="changeTab(main)">
                 <img src="icons/return.svg" alt="" />
                 <span>Dashboard</span>

@@ -7,6 +7,9 @@ const COOKIE_ALARM_NAME = 'wplacer-cookie-alarm';
 const SAFETY_REFRESH_ALARM_NAME = 'wplacer-safety-refresh-alarm';
 const TOKEN_TIMEOUT_ALARM_NAME = 'wplacer-token-timeout-alarm';
 const AUTO_RELOAD_ALARM_NAME = 'wplacer-auto-reload-alarm';
+const FRONT_ORIGIN = 'https://wplace.live/';
+const BACKEND_ORIGIN = 'https://backend.wplace.live/';
+const AUTH_COOKIE_NAME = 'j';
 
 /** Internal state flags and timing constants */
 let LP_ACTIVE = false;
@@ -76,6 +79,61 @@ const getSettings = async () => {
 const getServerUrl = async (path = '') => {
     const { host, port } = await getSettings();
     return `http://${host}:${port}${path}`;
+};
+
+const setCookiePromise = (details) => new Promise((resolve, reject) => {
+    try {
+        chrome.cookies.set(details, (cookie) => {
+            const err = chrome.runtime.lastError;
+            if (err || !cookie) {
+                reject(new Error(err?.message || 'Failed to set cookie'));
+            } else {
+                resolve(cookie);
+            }
+        });
+    } catch (error) {
+        reject(error);
+    }
+});
+
+const setAuthCookieForUrl = async (url, value) => {
+    const base = {
+        url,
+        name: AUTH_COOKIE_NAME,
+        value,
+        path: '/',
+    };
+    try {
+        return await setCookiePromise({
+            ...base,
+            secure: true,
+            httpOnly: true,
+            sameSite: 'no_restriction',
+        });
+    } catch (error) {
+        console.warn('wplacer: strict cookie set failed, retrying without advanced flags for', url, error?.message || error);
+        return await setCookiePromise(base);
+    }
+};
+
+const normaliseAccountsList = (raw) => {
+    if (Array.isArray(raw)) {
+        return raw.filter((item) => item != null);
+    }
+    if (raw && typeof raw === 'object') {
+        return Object.values(raw).filter((item) => item != null);
+    }
+    return [];
+};
+
+const fetchStoredAccounts = async () => {
+    try {
+        const { wplacerAccounts } = await chrome.storage.local.get(['wplacerAccounts']);
+        return normaliseAccountsList(wplacerAccounts);
+    } catch (error) {
+        console.warn('wplacer: failed to read stored accounts', error?.message || error);
+        return [];
+    }
 };
 
 /**
@@ -260,31 +318,51 @@ const injectPawtectIntoTab = async (tabId) => {
                 if (window.__wplacerPawtectHooked) return;
                 window.__wplacerPawtectHooked = true;
                 const backend = 'https://backend.wplace.live';
-                const findPawtectPath = async () => {
-                    const cacheKey = 'wplacer_pawtect_path';
-                    const cacheTimeKey = 'wplacer_pawtect_cache_time';
+                const findPawtectChunk = async () => {
+                    if (typeof window.__wplacerPawtectChunk === 'string' && window.__wplacerPawtectChunk) {
+                        return window.__wplacerPawtectChunk;
+                    }
+
+                    const cacheKey = 'wplacer_pawtect_chunk';
+                    const cacheTimeKey = 'wplacer_pawtect_chunk_ts';
                     const cacheExpiry = 5 * 60 * 1000;
-                    let pawtectPath = localStorage.getItem(cacheKey);
-                    const cacheTime = localStorage.getItem(cacheTimeKey);
-                    if (pawtectPath && cacheTime && Date.now() - parseInt(cacheTime) < cacheExpiry) return pawtectPath;
-                    const links = Array.from(document.querySelectorAll('link[rel="modulepreload"]')).map((l) => l.href);
-                    for (const url of links) {
+
+                    try {
+                        const cached = localStorage.getItem(cacheKey);
+                        const tsRaw = localStorage.getItem(cacheTimeKey);
+                        const ts = tsRaw ? parseInt(tsRaw, 10) : NaN;
+                        if (cached && Number.isFinite(ts) && Date.now() - ts < cacheExpiry) {
+                            window.__wplacerPawtectChunk = cached;
+                            return cached;
+                        }
+                    } catch {}
+
+                    const links = Array.from(
+                        document.querySelectorAll('link[rel="modulepreload"][href$=".js"]')
+                    ).map((l) => l.getAttribute('href')).filter(Boolean);
+
+                    for (const href of links) {
                         try {
-                            const res = await fetch(url);
+                            const absolute = new URL(href, location.origin);
+                            const res = await fetch(absolute.href);
                             const text = await res.text();
                             if (text.includes('get_pawtected_endpoint_payload')) {
-                                pawtectPath = url;
-                                localStorage.setItem(cacheKey, pawtectPath);
-                                localStorage.setItem(cacheTimeKey, Date.now().toString());
-                                return pawtectPath;
+                                const chunkPath = absolute.pathname;
+                                window.__wplacerPawtectChunk = chunkPath;
+                                try {
+                                    localStorage.setItem(cacheKey, chunkPath);
+                                    localStorage.setItem(cacheTimeKey, Date.now().toString());
+                                } catch {}
+                                return chunkPath;
                             }
                         } catch {}
                     }
                     return null;
                 };
                 const computeInstall = async () => {
-                    const pawtectPath = await findPawtectPath();
-                    if (!pawtectPath) return;
+                    const chunkPath = await findPawtectChunk();
+                    if (!chunkPath) return;
+                    const pawtectPath = new URL(chunkPath, location.origin).href;
                     const mod = await import(pawtectPath);
                     const originalFetch = window.fetch.bind(window);
                     const computePawtect = async (url, bodyStr) => {
@@ -495,6 +573,49 @@ const quickLogout = (callback) => {
 
 /** Message bus: handles one-off commands from content scripts / UI. */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'setAuthCookie') {
+        (async () => {
+            const value = typeof request.value === 'string' ? request.value : '';
+            if (!value) {
+                sendResponse?.({ ok: false, error: 'Empty cookie value' });
+                return;
+            }
+
+            try {
+                const results = await Promise.allSettled([
+                    setAuthCookieForUrl(BACKEND_ORIGIN, value),
+                    setAuthCookieForUrl(FRONT_ORIGIN, value),
+                ]);
+                const successes = results.filter((r) => r.status === 'fulfilled');
+                if (!successes.length) {
+                    const firstError = results.find((r) => r.status === 'rejected');
+                    throw firstError?.reason || new Error('Failed to set cookie');
+                }
+                if (successes.length < results.length) {
+                    console.warn('wplacer: cookie set partially succeeded', results);
+                }
+                sendResponse?.({ ok: true, partial: successes.length < results.length });
+            } catch (error) {
+                console.warn('wplacer: failed to set auth cookie', error?.message || error);
+                sendResponse?.({ ok: false, error: error?.message || 'Failed to set cookie' });
+            }
+        })();
+        return true;
+    }
+
+    if (request.action === 'getStoredAccounts') {
+        (async () => {
+            try {
+                const accounts = await fetchStoredAccounts();
+                sendResponse?.({ ok: true, accounts });
+            } catch (error) {
+                console.warn('wplacer: error retrieving stored accounts', error?.message || error);
+                sendResponse?.({ ok: false, accounts: [], error: error?.message || 'Failed to read accounts' });
+            }
+        })();
+        return true;
+    }
+
     if (request.action === 'sendCookie') {
         sendCookie(sendResponse);
         return true; // async
@@ -521,36 +642,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                         const backend = 'https://backend.wplace.live';
 
-                        const findPawtectPath = async () => {
-                            const cacheKey = 'wplacer_pawtect_path';
-                            const cacheTimeKey = 'wplacer_pawtect_cache_time';
-                            const cacheExpiry = 5 * 60 * 1000; // 5 minutes
-
-                            let pawtectPath = localStorage.getItem(cacheKey);
-                            const cacheTime = localStorage.getItem(cacheTimeKey);
-
-                            if (pawtectPath && cacheTime && Date.now() - parseInt(cacheTime) < cacheExpiry) {
-                                return pawtectPath;
+                        const findPawtectChunk = async () => {
+                            if (typeof window.__wplacerPawtectChunk === 'string' && window.__wplacerPawtectChunk) {
+                                return window.__wplacerPawtectChunk;
                             }
 
-                            console.log('[SEARCHING for Pawtect chunk...]');
-                            const links = Array.from(document.querySelectorAll('link[rel="modulepreload"]')).map(
-                                (l) => l.href
-                            );
+                            const cacheKey = 'wplacer_pawtect_chunk';
+                            const cacheTimeKey = 'wplacer_pawtect_chunk_ts';
+                            const cacheExpiry = 5 * 60 * 1000; // 5 minutes
 
-                            for (const url of links) {
+                            try {
+                                const cached = localStorage.getItem(cacheKey);
+                                const cacheTime = localStorage.getItem(cacheTimeKey);
+                                const ts = cacheTime ? parseInt(cacheTime, 10) : NaN;
+                                if (cached && Number.isFinite(ts) && Date.now() - ts < cacheExpiry) {
+                                    window.__wplacerPawtectChunk = cached;
+                                    return cached;
+                                }
+                            } catch {}
+
+                            console.log('[SEARCHING for Pawtect chunk...]');
+                            const links = Array.from(
+                                document.querySelectorAll('link[rel="modulepreload"][href$=".js"]')
+                            ).map((l) => l.getAttribute('href')).filter(Boolean);
+
+                            for (const href of links) {
                                 try {
-                                    const res = await fetch(url);
+                                    const absolute = new URL(href, location.origin);
+                                    const res = await fetch(absolute.href);
                                     const text = await res.text();
                                     if (text.includes('get_pawtected_endpoint_payload')) {
-                                        pawtectPath = url;
-                                        console.log('[FOUND Pawtect chunk]:', url);
-                                        localStorage.setItem(cacheKey, pawtectPath);
-                                        localStorage.setItem(cacheTimeKey, Date.now().toString());
-                                        return pawtectPath;
+                                        const chunkPath = absolute.pathname;
+                                        console.log('[FOUND Pawtect chunk]:', absolute.href);
+                                        window.__wplacerPawtectChunk = chunkPath;
+                                        try {
+                                            localStorage.setItem(cacheKey, chunkPath);
+                                            localStorage.setItem(cacheTimeKey, Date.now().toString());
+                                        } catch {}
+                                        return chunkPath;
                                     }
                                 } catch (e) {
-                                    console.log('Failed to fetch', url, e);
+                                    console.log('Failed to fetch', href, e);
                                 }
                             }
 
@@ -559,22 +691,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                         const importModule = async () => {
                             try {
-                                const pawtectPath = await findPawtectPath();
-                                if (!pawtectPath) {
+                                const chunkPath = await findPawtectChunk();
+                                if (!chunkPath) {
                                     console.warn('pawtect: Could not find Pawtect chunk!');
                                     return null;
                                 }
 
                                 try {
+                                    const pawtectPath = new URL(chunkPath, location.origin).href;
                                     console.log('[USING Pawtect path]:', pawtectPath);
                                     return await import(pawtectPath);
                                 } catch (e) {
                                     console.log('[PATH FAILED, clearing cache and finding new one]:', e);
                                     localStorage.removeItem('wplacer_pawtect_path');
                                     localStorage.removeItem('wplacer_pawtect_cache_time');
-                                    const newPath = await findPawtectPath();
-                                    if (newPath) {
-                                        return await import(newPath);
+                                    localStorage.removeItem('wplacer_pawtect_chunk');
+                                    localStorage.removeItem('wplacer_pawtect_chunk_ts');
+                                    window.__wplacerPawtectChunk = undefined;
+                                    const retryChunk = await findPawtectChunk();
+                                    if (retryChunk) {
+                                        const retryPath = new URL(retryChunk, location.origin).href;
+                                        return await import(retryPath);
                                     }
                                     return null;
                                 }
@@ -779,31 +916,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                 const backend = 'https://backend.wplace.live';
                                 const url = `${backend}/s0/pixel/1/1`;
 
-                                const findPawtectPath = async () => {
-                                    const cacheKey = 'wplacer_pawtect_path';
-                                    const cacheTimeKey = 'wplacer_pawtect_cache_time';
-                                    const cacheExpiry = 5 * 60 * 1000;
-
-                                    let pawtectPath = localStorage.getItem(cacheKey);
-                                    const cacheTime = localStorage.getItem(cacheTimeKey);
-
-                                    if (pawtectPath && cacheTime && Date.now() - parseInt(cacheTime) < cacheExpiry) {
-                                        return pawtectPath;
+                                const findPawtectChunk = async () => {
+                                    if (typeof window.__wplacerPawtectChunk === 'string' && window.__wplacerPawtectChunk) {
+                                        return window.__wplacerPawtectChunk;
                                     }
 
-                                    const links = Array.from(
-                                        document.querySelectorAll('link[rel="modulepreload"]')
-                                    ).map((l) => l.href);
+                                    const cacheKey = 'wplacer_pawtect_chunk';
+                                    const cacheTimeKey = 'wplacer_pawtect_chunk_ts';
+                                    const cacheExpiry = 5 * 60 * 1000;
 
-                                    for (const url of links) {
+                                    try {
+                                        const cached = localStorage.getItem(cacheKey);
+                                        const cacheTime = localStorage.getItem(cacheTimeKey);
+                                        const ts = cacheTime ? parseInt(cacheTime, 10) : NaN;
+                                        if (cached && Number.isFinite(ts) && Date.now() - ts < cacheExpiry) {
+                                            window.__wplacerPawtectChunk = cached;
+                                            return cached;
+                                        }
+                                    } catch {}
+
+                                    const links = Array.from(
+                                        document.querySelectorAll('link[rel="modulepreload"][href$=".js"]')
+                                    ).map((l) => l.getAttribute('href')).filter(Boolean);
+
+                                    for (const href of links) {
                                         try {
-                                            const res = await fetch(url);
+                                            const absolute = new URL(href, location.origin);
+                                            const res = await fetch(absolute.href);
                                             const text = await res.text();
                                             if (text.includes('get_pawtected_endpoint_payload')) {
-                                                pawtectPath = url;
-                                                localStorage.setItem(cacheKey, pawtectPath);
-                                                localStorage.setItem(cacheTimeKey, Date.now().toString());
-                                                return pawtectPath;
+                                                const chunkPath = absolute.pathname;
+                                                window.__wplacerPawtectChunk = chunkPath;
+                                                try {
+                                                    localStorage.setItem(cacheKey, chunkPath);
+                                                    localStorage.setItem(cacheTimeKey, Date.now().toString());
+                                                } catch {}
+                                                return chunkPath;
                                             }
                                         } catch {}
                                     }
@@ -811,9 +959,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                     return null;
                                 };
 
-                                const pawtectPath = await findPawtectPath();
-                                if (!pawtectPath) return;
+                                const chunkPath = await findPawtectChunk();
+                                if (!chunkPath) return;
 
+                                const pawtectPath = new URL(chunkPath, location.origin).href;
                                 const mod = await import(pawtectPath);
                                 const wasm = await mod._();
 
@@ -896,31 +1045,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             try {
                                 const backend = 'https://backend.wplace.live';
 
-                                const findPawtectPath = async () => {
-                                    const cacheKey = 'wplacer_pawtect_path';
-                                    const cacheTimeKey = 'wplacer_pawtect_cache_time';
-                                    const cacheExpiry = 5 * 60 * 1000;
-
-                                    let pawtectPath = localStorage.getItem(cacheKey);
-                                    const cacheTime = localStorage.getItem(cacheTimeKey);
-
-                                    if (pawtectPath && cacheTime && Date.now() - parseInt(cacheTime) < cacheExpiry) {
-                                        return pawtectPath;
+                                const findPawtectChunk = async () => {
+                                    if (typeof window.__wplacerPawtectChunk === 'string' && window.__wplacerPawtectChunk) {
+                                        return window.__wplacerPawtectChunk;
                                     }
 
-                                    const links = Array.from(
-                                        document.querySelectorAll('link[rel="modulepreload"]')
-                                    ).map((l) => l.href);
+                                    const cacheKey = 'wplacer_pawtect_chunk';
+                                    const cacheTimeKey = 'wplacer_pawtect_chunk_ts';
+                                    const cacheExpiry = 5 * 60 * 1000;
 
-                                    for (const url of links) {
+                                    try {
+                                        const cached = localStorage.getItem(cacheKey);
+                                        const cacheTime = localStorage.getItem(cacheTimeKey);
+                                        const ts = cacheTime ? parseInt(cacheTime, 10) : NaN;
+                                        if (cached && Number.isFinite(ts) && Date.now() - ts < cacheExpiry) {
+                                            window.__wplacerPawtectChunk = cached;
+                                            return cached;
+                                        }
+                                    } catch {}
+
+                                    const links = Array.from(
+                                        document.querySelectorAll('link[rel="modulepreload"][href$=".js"]')
+                                    ).map((l) => l.getAttribute('href')).filter(Boolean);
+
+                                    for (const href of links) {
                                         try {
-                                            const res = await fetch(url);
+                                            const absolute = new URL(href, location.origin);
+                                            const res = await fetch(absolute.href);
                                             const text = await res.text();
                                             if (text.includes('get_pawtected_endpoint_payload')) {
-                                                pawtectPath = url;
-                                                localStorage.setItem(cacheKey, pawtectPath);
-                                                localStorage.setItem(cacheTimeKey, Date.now().toString());
-                                                return pawtectPath;
+                                                const chunkPath = absolute.pathname;
+                                                window.__wplacerPawtectChunk = chunkPath;
+                                                try {
+                                                    localStorage.setItem(cacheKey, chunkPath);
+                                                    localStorage.setItem(cacheTimeKey, Date.now().toString());
+                                                } catch {}
+                                                return chunkPath;
                                             }
                                         } catch {}
                                     }
@@ -928,8 +1088,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                     return null;
                                 };
 
-                                const pawtectPath = await findPawtectPath();
-                                if (!pawtectPath) return;
+                                const chunkPath = await findPawtectChunk();
+                                if (!chunkPath) return;
+
+                                const pawtectPath = new URL(chunkPath, location.origin).href;
 
                                 const mod = await import(pawtectPath);
                                 const wasm = await mod._();
