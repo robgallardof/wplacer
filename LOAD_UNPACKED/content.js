@@ -187,10 +187,10 @@ const postToken = (token, pawtectToken) => {
     });
 };
 
-const BRIDGE_MAX_ATTEMPTS = 5;
-const BRIDGE_RETRY_DELAY_MS = 600;
+const BRIDGE_MAX_ATTEMPTS = 8;
+const BRIDGE_RETRY_DELAY_MS = 900;
 
-const requestTokenWithoutReload = async (force = true, timeoutMs = 7000, attempt = 0) => {
+const requestTokenWithoutReload = async (force = true, timeoutMs = 7500, attempt = 0) => {
     const handled = await new Promise((resolve) => {
         try {
             const requestId = `req_${generateRandomHex(8)}`;
@@ -242,8 +242,18 @@ const requestTokenWithoutReload = async (force = true, timeoutMs = 7000, attempt
             resolve(false);
         }
     });
-    if (handled) return true;
-    if (attempt >= BRIDGE_MAX_ATTEMPTS - 1) return false;
+    if (handled) {
+        return { handled: true };
+    }
+    if (attempt >= BRIDGE_MAX_ATTEMPTS - 1) {
+        const retryAfterMs = BRIDGE_RETRY_DELAY_MS * (attempt + 2);
+        return {
+            handled: false,
+            reason: 'bridge-timeout',
+            attempts: attempt + 1,
+            retryAfterMs,
+        };
+    }
     await new Promise((r) => setTimeout(r, BRIDGE_RETRY_DELAY_MS * (attempt + 1)));
     return requestTokenWithoutReload(force, timeoutMs, attempt + 1);
 };
@@ -358,14 +368,21 @@ window.addEventListener('message', (event) => {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "reloadForToken") {
         (async () => {
-            const handled = await requestTokenWithoutReload(true, 8000);
-            if (handled) {
+            const result = await requestTokenWithoutReload(true, 8500);
+            if (result?.handled) {
                 console.log('wplacer: Token request handled without full reload.');
                 try { sendResponse?.({ handled: true }); } catch {}
                 return;
             }
             console.warn('wplacer: Token bridge unavailable after retries. Reporting back without forcing reload.');
-            try { sendResponse?.({ handled: false }); } catch {}
+            try {
+                sendResponse?.({
+                    handled: false,
+                    reason: result?.reason || 'bridge-timeout',
+                    attempts: result?.attempts || BRIDGE_MAX_ATTEMPTS,
+                    retryAfterMs: result?.retryAfterMs || BRIDGE_RETRY_DELAY_MS * BRIDGE_MAX_ATTEMPTS,
+                });
+            } catch {}
         })();
         return true;
     }

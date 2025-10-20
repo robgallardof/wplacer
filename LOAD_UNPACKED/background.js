@@ -22,12 +22,13 @@ const TOKEN_TIMEOUT_MS = 25000;
 /** Fast-retry spacing and cap. */
 const FAST_RETRY_DELAY_MS = 7000;
 const FAST_RETRY_MAX = 3;
-const BRIDGE_FAILURE_THRESHOLD = 3;
+const BRIDGE_FAILURE_THRESHOLD = 5;
 const BRIDGE_RETRY_DELAY_MS = 1500;
 
 let TOKEN_TIMEOUT_ID = null;
 let fastRetriesLeft = 0;
 let consecutiveBridgeFailures = 0;
+let bridgeDeferUntil = 0;
 
 /**
  * Sleep helper.
@@ -67,10 +68,18 @@ const isRetryableMessagingError = (error) => {
  *   handle the request without a reload.
  */
 const requestTokenViaContent = async (tabId, attempts = 5) => {
+    let lastResponse = null;
     for (let attempt = 0; attempt < attempts; attempt++) {
         try {
             const response = await chrome.tabs.sendMessage(tabId, { action: 'reloadForToken' });
-            return response?.handled === true;
+            if (response?.handled === true) {
+                return true;
+            }
+
+            if (response && typeof response.retryAfterMs === 'number' && response.retryAfterMs > 0) {
+                bridgeDeferUntil = Math.max(bridgeDeferUntil, Date.now() + response.retryAfterMs);
+            }
+            lastResponse = response || lastResponse;
         } catch (error) {
             if (!isRetryableMessagingError(error) || attempt === attempts - 1) {
                 if (error && !isRetryableMessagingError(error)) {
@@ -81,7 +90,7 @@ const requestTokenViaContent = async (tabId, attempts = 5) => {
             await wait(250 * (attempt + 1));
         }
     }
-    return false;
+    return lastResponse?.handled === true;
 };
 
 /**
@@ -277,6 +286,7 @@ const clearTokenWait = () => {
     TOKEN_IN_PROGRESS = false;
     fastRetriesLeft = 0;
     consecutiveBridgeFailures = 0;
+    bridgeDeferUntil = 0;
 };
 
 /**
@@ -288,6 +298,14 @@ const maybeInitiateReload = async () => {
     const now = Date.now();
     if (TOKEN_IN_PROGRESS) return;
     if (now - LAST_RELOAD_AT < MIN_RELOAD_INTERVAL_MS) return;
+    if (bridgeDeferUntil > now) {
+        const waitMs = bridgeDeferUntil - now;
+        bridgeDeferUntil = 0;
+        setTimeout(() => {
+            maybeInitiateReload().catch(() => {});
+        }, waitMs);
+        return;
+    }
 
     TOKEN_IN_PROGRESS = true;
     await initiateReload();
@@ -516,6 +534,7 @@ const initiateReload = async () => {
 
         if (handledByContent) {
             consecutiveBridgeFailures = 0;
+            bridgeDeferUntil = 0;
             console.log(`wplacer: Content script is handling token generation without reload for tab #${targetTab.id}.`);
             return;
         }
