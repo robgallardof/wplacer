@@ -461,34 +461,40 @@ const initiateReload = async () => {
         await wait(150);
 
         console.log(`wplacer: Sending reload command to tab #${targetTab.id}`);
+        let handledByContent = false;
         try {
-            await chrome.tabs.sendMessage(targetTab.id, { action: 'reloadForToken' });
+            const response = await chrome.tabs.sendMessage(targetTab.id, { action: 'reloadForToken' });
+            handledByContent = response?.handled === true;
         } catch {}
 
-        // Ensure reload even if content script didn't handle the message.
-        setTimeout(async () => {
-            try {
-                await chrome.tabs.update(targetTab.id, { active: true });
-            } catch {}
-            try {
-                await chrome.tabs.reload(targetTab.id, { bypassCache: true });
-            } catch {
-                try {
-                    const base = (targetTab.url || 'https://wplace.live/').replace(/[#?]$/, '');
-                    const url = base + (base.includes('?') ? '&' : '?') + 'wplacer=' + Date.now();
-                    await chrome.tabs.update(targetTab.id, { url });
-                } catch {}
-            }
-            // Second shot after ~1.5s if it didn't start loading
+        if (!handledByContent) {
+            // Ensure reload even if content script didn't handle the message.
             setTimeout(async () => {
                 try {
-                    const t = await chrome.tabs.get(targetTab.id);
-                    if (t.status !== 'loading') {
-                        await chrome.tabs.reload(targetTab.id, { bypassCache: true });
-                    }
+                    await chrome.tabs.update(targetTab.id, { active: true });
                 } catch {}
-            }, 1500);
-        }, 200);
+                try {
+                    await chrome.tabs.reload(targetTab.id, { bypassCache: true });
+                } catch {
+                    try {
+                        const base = (targetTab.url || 'https://wplace.live/').replace(/[#?]$/, '');
+                        const url = base + (base.includes('?') ? '&' : '?') + 'wplacer=' + Date.now();
+                        await chrome.tabs.update(targetTab.id, { url });
+                    } catch {}
+                }
+                // Second shot after ~1.5s if it didn't start loading
+                setTimeout(async () => {
+                    try {
+                        const t = await chrome.tabs.get(targetTab.id);
+                        if (t.status !== 'loading') {
+                            await chrome.tabs.reload(targetTab.id, { bypassCache: true });
+                        }
+                    } catch {}
+                }, 1500);
+            }, 200);
+        } else {
+            console.log(`wplacer: Content script is handling token generation without reload for tab #${targetTab.id}.`);
+        }
     } catch (error) {
         console.error('wplacer: Error sending reload message to tab, falling back to direct reload.', error);
         const tabs = await chrome.tabs.query({ url: 'https://wplace.live/*' });
