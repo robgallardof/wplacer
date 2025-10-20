@@ -187,8 +187,11 @@ const postToken = (token, pawtectToken) => {
     });
 };
 
-const requestTokenWithoutReload = (force = true, timeoutMs = 7000) => {
-    return new Promise((resolve) => {
+const BRIDGE_MAX_ATTEMPTS = 3;
+const BRIDGE_RETRY_DELAY_MS = 450;
+
+const requestTokenWithoutReload = async (force = true, timeoutMs = 7000, attempt = 0) => {
+    const handled = await new Promise((resolve) => {
         try {
             const requestId = `req_${generateRandomHex(8)}`;
             let settled = false;
@@ -239,6 +242,10 @@ const requestTokenWithoutReload = (force = true, timeoutMs = 7000) => {
             resolve(false);
         }
     });
+    if (handled) return true;
+    if (attempt >= BRIDGE_MAX_ATTEMPTS - 1) return false;
+    await new Promise((r) => setTimeout(r, BRIDGE_RETRY_DELAY_MS * (attempt + 1)));
+    return requestTokenWithoutReload(force, timeoutMs, attempt + 1);
 };
 
 window.addEventListener('message', (event) => {

@@ -43,6 +43,8 @@ if (!existsSync(HEAT_MAPS_DIR)) {
     } catch (_) {}
 }
 
+const HEAT_MAPS_ROOT = path.resolve(HEAT_MAPS_DIR);
+
 // Backups directories
 try {
     if (!existsSync(BACKUPS_ROOT_DIR)) mkdirSync(BACKUPS_ROOT_DIR, { recursive: true });
@@ -2914,6 +2916,32 @@ class TemplateManager {
 const app = express();
 app.use(cors());
 app.use(express.static('public'));
+app.get('/data/heat_maps/:file', (req, res, next) => {
+    try {
+        const { file } = req.params;
+        if (typeof file !== 'string' || !/^[-\w]+\.jsonl$/i.test(file)) {
+            res.status(400).json({ error: 'Invalid heatmap file' });
+            return;
+        }
+
+        const requestedPath = path.resolve(HEAT_MAPS_ROOT, file);
+        if (!requestedPath.startsWith(HEAT_MAPS_ROOT)) {
+            res.status(400).json({ error: 'Invalid heatmap file' });
+            return;
+        }
+
+        if (!existsSync(requestedPath)) {
+            res.status(204).end();
+            return;
+        }
+
+        res.sendFile(requestedPath, (err) => {
+            if (err) next(err);
+        });
+    } catch (error) {
+        next(error);
+    }
+});
 app.use('/data', express.static('data'));
 app.use(express.json({ limit: Infinity }));
 

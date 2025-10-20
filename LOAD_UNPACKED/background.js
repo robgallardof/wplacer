@@ -35,6 +35,54 @@ let fastRetriesLeft = 0;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Determines whether a messaging error indicates the frame is not yet ready.
+ * Chrome reports several different messages for this situation depending on
+ * timing, so we normalise them into a single retryable signal.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+const isRetryableMessagingError = (error) => {
+    if (!error) return false;
+    const message = typeof error === 'string' ? error : error?.message || '';
+    if (!message) return false;
+    return (
+        message.includes('Frame') ||
+        message.includes('No tab with id') ||
+        message.includes('Receiving end does not exist') ||
+        message.includes('Could not establish connection')
+    );
+};
+
+/**
+ * Attempts to notify the content script that a token refresh is required
+ * without forcing a full tab reload. A couple of retries are performed to
+ * give the page script time to finish booting before we fall back to a reload.
+ *
+ * @param {number} tabId
+ * @param {number} [attempts=3]
+ * @returns {Promise<boolean>} true when the content script confirmed it will
+ *   handle the request without a reload.
+ */
+const requestTokenViaContent = async (tabId, attempts = 3) => {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        try {
+            const response = await chrome.tabs.sendMessage(tabId, { action: 'reloadForToken' });
+            return response?.handled === true;
+        } catch (error) {
+            if (!isRetryableMessagingError(error) || attempt === attempts - 1) {
+                if (error && !isRetryableMessagingError(error)) {
+                    console.warn('wplacer: token bridge message failed', error?.message || error);
+                }
+                break;
+            }
+            await wait(250 * (attempt + 1));
+        }
+    }
+    return false;
+};
+
+/**
  * Safely clears an existing timeout handle if present.
  */
 const clearTokenTimeout = () => {
@@ -461,13 +509,10 @@ const initiateReload = async () => {
         await wait(150);
 
         console.log(`wplacer: Sending reload command to tab #${targetTab.id}`);
-        let handledByContent = false;
-        try {
-            const response = await chrome.tabs.sendMessage(targetTab.id, { action: 'reloadForToken' });
-            handledByContent = response?.handled === true;
-        } catch {}
+        const handledByContent = await requestTokenViaContent(targetTab.id);
 
         if (!handledByContent) {
+            LAST_RELOAD_AT = Date.now();
             // Ensure reload even if content script didn't handle the message.
             setTimeout(async () => {
                 try {
@@ -494,13 +539,16 @@ const initiateReload = async () => {
             }, 200);
         } else {
             console.log(`wplacer: Content script is handling token generation without reload for tab #${targetTab.id}.`);
+            return;
         }
     } catch (error) {
         console.error('wplacer: Error sending reload message to tab, falling back to direct reload.', error);
         const tabs = await chrome.tabs.query({ url: 'https://wplace.live/*' });
         if (tabs?.length) {
+            LAST_RELOAD_AT = Date.now();
             chrome.tabs.reload((tabs.find((t) => t.active) || tabs[0]).id);
         } else {
+            LAST_RELOAD_AT = Date.now();
             await chrome.tabs.create({ url: 'https://wplace.live/' });
         }
     }
