@@ -4,7 +4,6 @@
  */
 const POLL_ALARM_NAME = 'wplacer-poll-alarm';
 const COOKIE_ALARM_NAME = 'wplacer-cookie-alarm';
-const SAFETY_REFRESH_ALARM_NAME = 'wplacer-safety-refresh-alarm';
 const TOKEN_TIMEOUT_ALARM_NAME = 'wplacer-token-timeout-alarm';
 const AUTO_RELOAD_ALARM_NAME = 'wplacer-auto-reload-alarm';
 const FRONT_ORIGIN = 'https://wplace.live/';
@@ -23,9 +22,13 @@ const TOKEN_TIMEOUT_MS = 25000;
 /** Fast-retry spacing and cap. */
 const FAST_RETRY_DELAY_MS = 7000;
 const FAST_RETRY_MAX = 3;
+const BRIDGE_FAILURE_THRESHOLD = 5;
+const BRIDGE_RETRY_DELAY_MS = 1500;
 
 let TOKEN_TIMEOUT_ID = null;
 let fastRetriesLeft = 0;
+let consecutiveBridgeFailures = 0;
+let bridgeDeferUntil = 0;
 
 /**
  * Sleep helper.
@@ -33,6 +36,62 @@ let fastRetriesLeft = 0;
  * @returns {Promise<void>}
  */
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Determines whether a messaging error indicates the frame is not yet ready.
+ * Chrome reports several different messages for this situation depending on
+ * timing, so we normalise them into a single retryable signal.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+const isRetryableMessagingError = (error) => {
+    if (!error) return false;
+    const message = typeof error === 'string' ? error : error?.message || '';
+    if (!message) return false;
+    return (
+        message.includes('Frame') ||
+        message.includes('No tab with id') ||
+        message.includes('Receiving end does not exist') ||
+        message.includes('Could not establish connection')
+    );
+};
+
+/**
+ * Attempts to notify the content script that a token refresh is required
+ * without forcing a full tab reload. A couple of retries are performed to
+ * give the page script time to finish booting before we fall back to a reload.
+ *
+ * @param {number} tabId
+ * @param {number} [attempts=3]
+ * @returns {Promise<boolean>} true when the content script confirmed it will
+ *   handle the request without a reload.
+ */
+const requestTokenViaContent = async (tabId, attempts = 5) => {
+    let lastResponse = null;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        try {
+            const response = await chrome.tabs.sendMessage(tabId, { action: 'reloadForToken' });
+            if (response?.handled === true) {
+                return true;
+            }
+
+            if (response && typeof response.retryAfterMs === 'number' && response.retryAfterMs > 0) {
+                bridgeDeferUntil = Math.max(bridgeDeferUntil, Date.now() + response.retryAfterMs);
+            }
+            lastResponse = response || lastResponse;
+        } catch (error) {
+            if (!isRetryableMessagingError(error) || attempt === attempts - 1) {
+                if (error && !isRetryableMessagingError(error)) {
+                    console.warn('wplacer: token bridge message failed', error?.message || error);
+                }
+                break;
+            }
+            await wait(250 * (attempt + 1));
+        }
+    }
+    return lastResponse?.handled === true;
+};
 
 /**
  * Safely clears an existing timeout handle if present.
@@ -226,6 +285,8 @@ const clearTokenWait = () => {
     clearTokenTimeout();
     TOKEN_IN_PROGRESS = false;
     fastRetriesLeft = 0;
+    consecutiveBridgeFailures = 0;
+    bridgeDeferUntil = 0;
 };
 
 /**
@@ -237,6 +298,14 @@ const maybeInitiateReload = async () => {
     const now = Date.now();
     if (TOKEN_IN_PROGRESS) return;
     if (now - LAST_RELOAD_AT < MIN_RELOAD_INTERVAL_MS) return;
+    if (bridgeDeferUntil > now) {
+        const waitMs = bridgeDeferUntil - now;
+        bridgeDeferUntil = 0;
+        setTimeout(() => {
+            maybeInitiateReload().catch(() => {});
+        }, waitMs);
+        return;
+    }
 
     TOKEN_IN_PROGRESS = true;
     await initiateReload();
@@ -318,31 +387,51 @@ const injectPawtectIntoTab = async (tabId) => {
                 if (window.__wplacerPawtectHooked) return;
                 window.__wplacerPawtectHooked = true;
                 const backend = 'https://backend.wplace.live';
-                const findPawtectPath = async () => {
-                    const cacheKey = 'wplacer_pawtect_path';
-                    const cacheTimeKey = 'wplacer_pawtect_cache_time';
+                const findPawtectChunk = async () => {
+                    if (typeof window.__wplacerPawtectChunk === 'string' && window.__wplacerPawtectChunk) {
+                        return window.__wplacerPawtectChunk;
+                    }
+
+                    const cacheKey = 'wplacer_pawtect_chunk';
+                    const cacheTimeKey = 'wplacer_pawtect_chunk_ts';
                     const cacheExpiry = 5 * 60 * 1000;
-                    let pawtectPath = localStorage.getItem(cacheKey);
-                    const cacheTime = localStorage.getItem(cacheTimeKey);
-                    if (pawtectPath && cacheTime && Date.now() - parseInt(cacheTime) < cacheExpiry) return pawtectPath;
-                    const links = Array.from(document.querySelectorAll('link[rel="modulepreload"]')).map((l) => l.href);
-                    for (const url of links) {
+
+                    try {
+                        const cached = localStorage.getItem(cacheKey);
+                        const tsRaw = localStorage.getItem(cacheTimeKey);
+                        const ts = tsRaw ? parseInt(tsRaw, 10) : NaN;
+                        if (cached && Number.isFinite(ts) && Date.now() - ts < cacheExpiry) {
+                            window.__wplacerPawtectChunk = cached;
+                            return cached;
+                        }
+                    } catch {}
+
+                    const links = Array.from(
+                        document.querySelectorAll('link[rel="modulepreload"][href$=".js"]')
+                    ).map((l) => l.getAttribute('href')).filter(Boolean);
+
+                    for (const href of links) {
                         try {
-                            const res = await fetch(url);
+                            const absolute = new URL(href, location.origin);
+                            const res = await fetch(absolute.href);
                             const text = await res.text();
                             if (text.includes('get_pawtected_endpoint_payload')) {
-                                pawtectPath = url;
-                                localStorage.setItem(cacheKey, pawtectPath);
-                                localStorage.setItem(cacheTimeKey, Date.now().toString());
-                                return pawtectPath;
+                                const chunkPath = absolute.pathname;
+                                window.__wplacerPawtectChunk = chunkPath;
+                                try {
+                                    localStorage.setItem(cacheKey, chunkPath);
+                                    localStorage.setItem(cacheTimeKey, Date.now().toString());
+                                } catch {}
+                                return chunkPath;
                             }
                         } catch {}
                     }
                     return null;
                 };
                 const computeInstall = async () => {
-                    const pawtectPath = await findPawtectPath();
-                    if (!pawtectPath) return;
+                    const chunkPath = await findPawtectChunk();
+                    if (!chunkPath) return;
+                    const pawtectPath = new URL(chunkPath, location.origin).href;
                     const mod = await import(pawtectPath);
                     const originalFetch = window.fetch.bind(window);
                     const computePawtect = async (url, bodyStr) => {
@@ -440,13 +529,25 @@ const initiateReload = async () => {
         } catch {}
         await wait(150);
 
-        console.log(`wplacer: Sending reload command to tab #${targetTab.id}`);
-        try {
-            await chrome.tabs.sendMessage(targetTab.id, { action: 'reloadForToken' });
-        } catch {}
+        console.log(`wplacer: Requesting token bridge on tab #${targetTab.id}`);
+        const handledByContent = await requestTokenViaContent(targetTab.id);
 
-        // Ensure reload even if content script didn't handle the message.
-        setTimeout(async () => {
+        if (handledByContent) {
+            consecutiveBridgeFailures = 0;
+            bridgeDeferUntil = 0;
+            console.log(`wplacer: Content script is handling token generation without reload for tab #${targetTab.id}.`);
+            return;
+        }
+
+        consecutiveBridgeFailures += 1;
+        console.warn(
+            `wplacer: Token bridge did not respond (attempt ${consecutiveBridgeFailures}/${BRIDGE_FAILURE_THRESHOLD}).`
+        );
+
+        if (consecutiveBridgeFailures >= BRIDGE_FAILURE_THRESHOLD) {
+            console.warn('wplacer: Falling back to a guarded tab reload after repeated bridge failures.');
+            consecutiveBridgeFailures = 0;
+            LAST_RELOAD_AT = Date.now();
             try {
                 await chrome.tabs.update(targetTab.id, { active: true });
             } catch {}
@@ -459,22 +560,23 @@ const initiateReload = async () => {
                     await chrome.tabs.update(targetTab.id, { url });
                 } catch {}
             }
-            // Second shot after ~1.5s if it didn't start loading
-            setTimeout(async () => {
-                try {
-                    const t = await chrome.tabs.get(targetTab.id);
-                    if (t.status !== 'loading') {
-                        await chrome.tabs.reload(targetTab.id, { bypassCache: true });
-                    }
-                } catch {}
-            }, 1500);
-        }, 200);
+            return;
+        }
+
+        clearTokenTimeout();
+        TOKEN_IN_PROGRESS = false;
+        setTimeout(() => {
+            maybeInitiateReload().catch(() => {});
+        }, BRIDGE_RETRY_DELAY_MS);
+        return;
     } catch (error) {
         console.error('wplacer: Error sending reload message to tab, falling back to direct reload.', error);
         const tabs = await chrome.tabs.query({ url: 'https://wplace.live/*' });
         if (tabs?.length) {
+            LAST_RELOAD_AT = Date.now();
             chrome.tabs.reload((tabs.find((t) => t.active) || tabs[0]).id);
         } else {
+            LAST_RELOAD_AT = Date.now();
             await chrome.tabs.create({ url: 'https://wplace.live/' });
         }
     }
@@ -622,36 +724,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                         const backend = 'https://backend.wplace.live';
 
-                        const findPawtectPath = async () => {
-                            const cacheKey = 'wplacer_pawtect_path';
-                            const cacheTimeKey = 'wplacer_pawtect_cache_time';
-                            const cacheExpiry = 5 * 60 * 1000; // 5 minutes
-
-                            let pawtectPath = localStorage.getItem(cacheKey);
-                            const cacheTime = localStorage.getItem(cacheTimeKey);
-
-                            if (pawtectPath && cacheTime && Date.now() - parseInt(cacheTime) < cacheExpiry) {
-                                return pawtectPath;
+                        const findPawtectChunk = async () => {
+                            if (typeof window.__wplacerPawtectChunk === 'string' && window.__wplacerPawtectChunk) {
+                                return window.__wplacerPawtectChunk;
                             }
 
-                            console.log('[SEARCHING for Pawtect chunk...]');
-                            const links = Array.from(document.querySelectorAll('link[rel="modulepreload"]')).map(
-                                (l) => l.href
-                            );
+                            const cacheKey = 'wplacer_pawtect_chunk';
+                            const cacheTimeKey = 'wplacer_pawtect_chunk_ts';
+                            const cacheExpiry = 5 * 60 * 1000; // 5 minutes
 
-                            for (const url of links) {
+                            try {
+                                const cached = localStorage.getItem(cacheKey);
+                                const cacheTime = localStorage.getItem(cacheTimeKey);
+                                const ts = cacheTime ? parseInt(cacheTime, 10) : NaN;
+                                if (cached && Number.isFinite(ts) && Date.now() - ts < cacheExpiry) {
+                                    window.__wplacerPawtectChunk = cached;
+                                    return cached;
+                                }
+                            } catch {}
+
+                            console.log('[SEARCHING for Pawtect chunk...]');
+                            const links = Array.from(
+                                document.querySelectorAll('link[rel="modulepreload"][href$=".js"]')
+                            ).map((l) => l.getAttribute('href')).filter(Boolean);
+
+                            for (const href of links) {
                                 try {
-                                    const res = await fetch(url);
+                                    const absolute = new URL(href, location.origin);
+                                    const res = await fetch(absolute.href);
                                     const text = await res.text();
                                     if (text.includes('get_pawtected_endpoint_payload')) {
-                                        pawtectPath = url;
-                                        console.log('[FOUND Pawtect chunk]:', url);
-                                        localStorage.setItem(cacheKey, pawtectPath);
-                                        localStorage.setItem(cacheTimeKey, Date.now().toString());
-                                        return pawtectPath;
+                                        const chunkPath = absolute.pathname;
+                                        console.log('[FOUND Pawtect chunk]:', absolute.href);
+                                        window.__wplacerPawtectChunk = chunkPath;
+                                        try {
+                                            localStorage.setItem(cacheKey, chunkPath);
+                                            localStorage.setItem(cacheTimeKey, Date.now().toString());
+                                        } catch {}
+                                        return chunkPath;
                                     }
                                 } catch (e) {
-                                    console.log('Failed to fetch', url, e);
+                                    console.log('Failed to fetch', href, e);
                                 }
                             }
 
@@ -660,22 +773,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                         const importModule = async () => {
                             try {
-                                const pawtectPath = await findPawtectPath();
-                                if (!pawtectPath) {
+                                const chunkPath = await findPawtectChunk();
+                                if (!chunkPath) {
                                     console.warn('pawtect: Could not find Pawtect chunk!');
                                     return null;
                                 }
 
                                 try {
+                                    const pawtectPath = new URL(chunkPath, location.origin).href;
                                     console.log('[USING Pawtect path]:', pawtectPath);
                                     return await import(pawtectPath);
                                 } catch (e) {
                                     console.log('[PATH FAILED, clearing cache and finding new one]:', e);
                                     localStorage.removeItem('wplacer_pawtect_path');
                                     localStorage.removeItem('wplacer_pawtect_cache_time');
-                                    const newPath = await findPawtectPath();
-                                    if (newPath) {
-                                        return await import(newPath);
+                                    localStorage.removeItem('wplacer_pawtect_chunk');
+                                    localStorage.removeItem('wplacer_pawtect_chunk_ts');
+                                    window.__wplacerPawtectChunk = undefined;
+                                    const retryChunk = await findPawtectChunk();
+                                    if (retryChunk) {
+                                        const retryPath = new URL(retryChunk, location.origin).href;
+                                        return await import(retryPath);
                                     }
                                     return null;
                                 }
@@ -880,31 +998,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                 const backend = 'https://backend.wplace.live';
                                 const url = `${backend}/s0/pixel/1/1`;
 
-                                const findPawtectPath = async () => {
-                                    const cacheKey = 'wplacer_pawtect_path';
-                                    const cacheTimeKey = 'wplacer_pawtect_cache_time';
-                                    const cacheExpiry = 5 * 60 * 1000;
-
-                                    let pawtectPath = localStorage.getItem(cacheKey);
-                                    const cacheTime = localStorage.getItem(cacheTimeKey);
-
-                                    if (pawtectPath && cacheTime && Date.now() - parseInt(cacheTime) < cacheExpiry) {
-                                        return pawtectPath;
+                                const findPawtectChunk = async () => {
+                                    if (typeof window.__wplacerPawtectChunk === 'string' && window.__wplacerPawtectChunk) {
+                                        return window.__wplacerPawtectChunk;
                                     }
 
-                                    const links = Array.from(
-                                        document.querySelectorAll('link[rel="modulepreload"]')
-                                    ).map((l) => l.href);
+                                    const cacheKey = 'wplacer_pawtect_chunk';
+                                    const cacheTimeKey = 'wplacer_pawtect_chunk_ts';
+                                    const cacheExpiry = 5 * 60 * 1000;
 
-                                    for (const url of links) {
+                                    try {
+                                        const cached = localStorage.getItem(cacheKey);
+                                        const cacheTime = localStorage.getItem(cacheTimeKey);
+                                        const ts = cacheTime ? parseInt(cacheTime, 10) : NaN;
+                                        if (cached && Number.isFinite(ts) && Date.now() - ts < cacheExpiry) {
+                                            window.__wplacerPawtectChunk = cached;
+                                            return cached;
+                                        }
+                                    } catch {}
+
+                                    const links = Array.from(
+                                        document.querySelectorAll('link[rel="modulepreload"][href$=".js"]')
+                                    ).map((l) => l.getAttribute('href')).filter(Boolean);
+
+                                    for (const href of links) {
                                         try {
-                                            const res = await fetch(url);
+                                            const absolute = new URL(href, location.origin);
+                                            const res = await fetch(absolute.href);
                                             const text = await res.text();
                                             if (text.includes('get_pawtected_endpoint_payload')) {
-                                                pawtectPath = url;
-                                                localStorage.setItem(cacheKey, pawtectPath);
-                                                localStorage.setItem(cacheTimeKey, Date.now().toString());
-                                                return pawtectPath;
+                                                const chunkPath = absolute.pathname;
+                                                window.__wplacerPawtectChunk = chunkPath;
+                                                try {
+                                                    localStorage.setItem(cacheKey, chunkPath);
+                                                    localStorage.setItem(cacheTimeKey, Date.now().toString());
+                                                } catch {}
+                                                return chunkPath;
                                             }
                                         } catch {}
                                     }
@@ -912,9 +1041,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                     return null;
                                 };
 
-                                const pawtectPath = await findPawtectPath();
-                                if (!pawtectPath) return;
+                                const chunkPath = await findPawtectChunk();
+                                if (!chunkPath) return;
 
+                                const pawtectPath = new URL(chunkPath, location.origin).href;
                                 const mod = await import(pawtectPath);
                                 const wasm = await mod._();
 
@@ -997,31 +1127,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             try {
                                 const backend = 'https://backend.wplace.live';
 
-                                const findPawtectPath = async () => {
-                                    const cacheKey = 'wplacer_pawtect_path';
-                                    const cacheTimeKey = 'wplacer_pawtect_cache_time';
-                                    const cacheExpiry = 5 * 60 * 1000;
-
-                                    let pawtectPath = localStorage.getItem(cacheKey);
-                                    const cacheTime = localStorage.getItem(cacheTimeKey);
-
-                                    if (pawtectPath && cacheTime && Date.now() - parseInt(cacheTime) < cacheExpiry) {
-                                        return pawtectPath;
+                                const findPawtectChunk = async () => {
+                                    if (typeof window.__wplacerPawtectChunk === 'string' && window.__wplacerPawtectChunk) {
+                                        return window.__wplacerPawtectChunk;
                                     }
 
-                                    const links = Array.from(
-                                        document.querySelectorAll('link[rel="modulepreload"]')
-                                    ).map((l) => l.href);
+                                    const cacheKey = 'wplacer_pawtect_chunk';
+                                    const cacheTimeKey = 'wplacer_pawtect_chunk_ts';
+                                    const cacheExpiry = 5 * 60 * 1000;
 
-                                    for (const url of links) {
+                                    try {
+                                        const cached = localStorage.getItem(cacheKey);
+                                        const cacheTime = localStorage.getItem(cacheTimeKey);
+                                        const ts = cacheTime ? parseInt(cacheTime, 10) : NaN;
+                                        if (cached && Number.isFinite(ts) && Date.now() - ts < cacheExpiry) {
+                                            window.__wplacerPawtectChunk = cached;
+                                            return cached;
+                                        }
+                                    } catch {}
+
+                                    const links = Array.from(
+                                        document.querySelectorAll('link[rel="modulepreload"][href$=".js"]')
+                                    ).map((l) => l.getAttribute('href')).filter(Boolean);
+
+                                    for (const href of links) {
                                         try {
-                                            const res = await fetch(url);
+                                            const absolute = new URL(href, location.origin);
+                                            const res = await fetch(absolute.href);
                                             const text = await res.text();
                                             if (text.includes('get_pawtected_endpoint_payload')) {
-                                                pawtectPath = url;
-                                                localStorage.setItem(cacheKey, pawtectPath);
-                                                localStorage.setItem(cacheTimeKey, Date.now().toString());
-                                                return pawtectPath;
+                                                const chunkPath = absolute.pathname;
+                                                window.__wplacerPawtectChunk = chunkPath;
+                                                try {
+                                                    localStorage.setItem(cacheKey, chunkPath);
+                                                    localStorage.setItem(cacheTimeKey, Date.now().toString());
+                                                } catch {}
+                                                return chunkPath;
                                             }
                                         } catch {}
                                     }
@@ -1029,8 +1170,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                     return null;
                                 };
 
-                                const pawtectPath = await findPawtectPath();
-                                if (!pawtectPath) return;
+                                const chunkPath = await findPawtectChunk();
+                                if (!chunkPath) return;
+
+                                const pawtectPath = new URL(chunkPath, location.origin).href;
 
                                 const mod = await import(pawtectPath);
                                 const wasm = await mod._();
@@ -1153,7 +1296,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 /**
- * Alarm dispatcher for polling, cookie refresh, safety refresh, token timeout backup,
+ * Alarm dispatcher for polling, cookie refresh, token-timeout backups,
  * and optional user-configured auto-reload.
  */
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -1167,25 +1310,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === POLL_ALARM_NAME) {
         if (!LP_ACTIVE) startLongPoll();
         pollForTokenRequest();
-        return;
-    }
-    if (alarm.name === SAFETY_REFRESH_ALARM_NAME) {
-        // Safety net: force refresh wplace tabs every ~45s if not already refreshing
-        (async () => {
-            try {
-                if (TOKEN_IN_PROGRESS) return;
-                const now = Date.now();
-                if (now - LAST_RELOAD_AT < 45000) return;
-                const tabs = await chrome.tabs.query({ url: 'https://wplace.live/*' });
-                for (const tab of tabs || []) {
-                    try {
-                        await injectPawtectIntoTab(tab.id);
-                        await chrome.tabs.reload(tab.id, { bypassCache: true });
-                    } catch {}
-                }
-                LAST_RELOAD_AT = Date.now();
-            } catch {}
-        })();
         return;
     }
     if (alarm.name === TOKEN_TIMEOUT_ALARM_NAME) {
@@ -1208,7 +1332,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 /**
- * Initializes recurring alarms: polling, cookie refresh, safety refresh,
+ * Initializes recurring alarms: polling, cookie refresh,
  * and user-configured auto-reload.
  * @returns {Promise<void>}
  */
@@ -1221,10 +1345,6 @@ const initializeAlarms = async () => {
         await chrome.alarms.create(COOKIE_ALARM_NAME, {
             delayInMinutes: 1,
             periodInMinutes: 20,
-        });
-        await chrome.alarms.create(SAFETY_REFRESH_ALARM_NAME, {
-            delayInMinutes: 1,
-            periodInMinutes: 1,
         });
         await updateAutoReloadAlarm();
         console.log('wplacer: Alarms initialized.');
